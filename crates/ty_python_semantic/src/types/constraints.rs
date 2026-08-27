@@ -121,6 +121,7 @@ pub(crate) mod projection;
 mod sequents;
 mod solutions;
 mod support;
+mod variables;
 
 use paths::PathAssignments;
 use sequents::SequentMap;
