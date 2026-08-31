@@ -4804,6 +4804,7 @@ dependencies = [
  "ordermap",
  "parking_lot",
  "pep440_rs",
+ "pep508_rs",
  "rayon",
  "regex",
  "regex-automata",

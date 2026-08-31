@@ -1619,6 +1619,84 @@ mod uv_metadata {
     }
 
     #[test]
+    fn unused_dependencies_include_local_helpers_and_respect_suppressions() -> anyhow::Result<()> {
+        assert_uv_supports_script_metadata()?;
+
+        let case = CliTest::with_files([
+            (
+                "script.py",
+                r#"
+                # /// script
+                # requires-python = ">=3.8"
+                # dependencies = [
+                #     "direct-dependency",
+                #     "helper-dependency",
+                #     "unused-dependency",
+                # ]
+                # [tool.ty.environment]
+                # root = ["."]
+                # [tool.uv]
+                # no-index = true
+                # find-links = ["wheels"]
+                # ///
+
+                import direct_module
+                import helper
+
+                print(direct_module.value, helper.value)
+                "#,
+            ),
+            ("helper.py", "from helper_module import value\n"),
+        ])?;
+        for (distribution, module) in [
+            ("direct-dependency", "direct_module"),
+            ("helper-dependency", "helper_module"),
+            ("unused-dependency", "unused_module"),
+        ] {
+            write_dependency_wheel(&case, distribution, module, &[])?;
+        }
+
+        let mut command = command_with_script_uv(&case);
+        command
+            .args([
+                "script.py",
+                "--error",
+                "unused-dependency",
+                "--output-format",
+                "concise",
+            ])
+            .env("UV_OFFLINE", "1")
+            .env("UV_PYTHON_DOWNLOADS", "never");
+
+        assert_cmd_snapshot!(command, @"
+        success: false
+        exit_code: 1
+        ----- stdout -----
+        script.py:7:7: error[unused-dependency] Dependency `unused-dependency` is declared but never imported
+        Found 1 diagnostic
+
+        ----- stderr -----
+        ");
+
+        let script = fs::read_to_string(case.root().join("script.py"))?;
+        case.write_file(
+            "script.py",
+            &format!("# ty: ignore[unused-dependency]\n{script}"),
+        )?;
+
+        assert_cmd_snapshot!(command, @"
+        success: true
+        exit_code: 0
+        ----- stdout -----
+        All checks passed!
+
+        ----- stderr -----
+        ");
+
+        Ok(())
+    }
+
+    #[test]
     fn workspace_dependencies_do_not_apply_to_scripts() -> anyhow::Result<()> {
         assert_uv_supports_script_metadata()?;
 
