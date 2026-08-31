@@ -1,10 +1,9 @@
 use crate::{
     Db, ProgramEnvironment,
-    place::{DefinedPlace, Definedness, Place},
     reachability::ReachabilityConstraintsExtension,
     types::{
-        KnownClass, KnownInstanceType, MemberLookupPolicy, ParamSpecAttrKind, SubclassOfInner,
-        SubclassOfType, Type, TypeContext, TypeVarKind, UnionType,
+        KnownClass, KnownInstanceType, ParamSpecAttrKind, SubclassOfInner, SubclassOfType, Type,
+        TypeContext, TypeVarKind, UnionType,
         constraints::ConstraintSetBuilder,
         diagnostic::{
             ABSTRACT_AND_FINAL_METHOD, FINAL_ON_NON_METHOD, INVALID_PARAMETER_DEFAULT,
@@ -613,27 +612,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 && let Type::FunctionLiteral(function) = inferred_ty
             {
                 Type::FunctionLiteral(function.with_deprecated(db, *deprecated))
-            } else if FunctionDecorators::from_decorator_type(db, *decorator_ty)
-                .contains(FunctionDecorators::CLASSMETHOD)
-                && (ast::PythonVersion::PY39..ast::PythonVersion::PY313)
-                    .contains(&self.program_environment().python_version(db))
-                && let Place::Defined(DefinedPlace {
-                    ty: descriptor_get,
-                    definedness: Definedness::AlwaysDefined,
-                    ..
-                }) = inferred_ty
-                    .class_member_with_policy(
-                        db,
-                        self.program_environment(),
-                        "__get__",
-                        MemberLookupPolicy::REQUIRE_CONCRETE,
-                    )
-                    .place
-                && !descriptor_get.is_divergent()
-            {
-                // In Python 3.9–3.12, classmethod can wrap descriptors, including
-                // non-callable properties that its callable-only stub cannot represent.
-                KnownClass::Classmethod.to_instance(db, self.program_environment())
             } else {
                 self.apply_decorator(
                     *decorator_ty,

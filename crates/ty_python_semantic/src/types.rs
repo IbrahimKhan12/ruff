@@ -4253,28 +4253,6 @@ impl<'db> Type<'db> {
 
             match ty {
                 Type::KnownInstance(KnownInstanceType::MethodWrapper(wrapper)) => {
-                    if wrapper.kind(db) == MethodWrapperKind::Classmethod
-                        && (ast::PythonVersion::PY39..ast::PythonVersion::PY313)
-                            .contains(&env.python_version(db))
-                    {
-                        // These Python versions forward to the wrapped descriptor with the
-                        // class as both instance and owner. The outer classmethod remains a
-                        // non-data descriptor even when it wraps a property.
-                        match wrapper
-                            .wrapped(db)
-                            .try_call_dunder_get(db, env, Some(owner), owner)
-                        {
-                            Ok(Some(mut result)) => {
-                                result.kind = AttributeKind::NormalOrNonDataDescriptor;
-                                return Ok(Some(result));
-                            }
-                            Err(mut error) => {
-                                error.fallback.kind = AttributeKind::NormalOrNonDataDescriptor;
-                                return Err(error);
-                            }
-                            Ok(None) => {}
-                        }
-                    }
                     let return_type = match wrapper.kind(db) {
                         MethodWrapperKind::Staticmethod => wrapper.wrapped(db),
                         MethodWrapperKind::Classmethod => Type::KnownInstance(

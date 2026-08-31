@@ -271,7 +271,7 @@ pub enum KnownInstanceType<'db> {
     /// The bound `__call__` attribute of a precise `functools.partial(...)` result.
     FunctoolsPartialCall(FunctoolsPartialInstance<'db>),
 
-    /// A class or static method wrapping a decorated object, or its bound method.
+    /// A class or static method wrapping a decorated callable, or its bound method.
     MethodWrapper(MethodWrapper<'db>),
 }
 
