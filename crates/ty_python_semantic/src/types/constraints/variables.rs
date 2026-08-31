@@ -1,6 +1,8 @@
 //! The different conditions that can be checked by an interior node in a constraint set BDD
 #![expect(dead_code)]
 
+use std::fmt::Display;
+
 use itertools::Either;
 use salsa::plumbing::AsId;
 
@@ -149,6 +151,21 @@ impl<'db> Constraint<'db> {
             })),
         }
     }
+
+    pub(super) fn display<'a>(
+        self,
+        db: &'db dyn Db,
+        env: &'a ProgramEnvironment<'db>,
+        holds: Option<bool>,
+    ) -> impl Display + 'a {
+        std::fmt::from_fn(move |f| match self {
+            Constraint::ConcreteLower(this) => this.display(db, env, holds).fmt(f),
+            Constraint::ConcreteUpper(this) => this.display(db, env, holds).fmt(f),
+            Constraint::ConcreteEquivalence(this) => this.display(db, env, holds).fmt(f),
+            Constraint::TypeVarRange(this) => this.display(db, holds).fmt(f),
+            Constraint::TypeVarEquivalence(this) => this.display(db, holds).fmt(f),
+        })
+    }
 }
 
 /// Restricts a single typevar so that a concrete lower bound is assignable to it. (A concrete type
@@ -164,6 +181,29 @@ pub(super) struct ConcreteLowerBound<'db> {
     pub(super) bound: Type<'db>,
 }
 
+impl<'db> ConcreteLowerBound<'db> {
+    fn display<'a>(
+        self,
+        db: &'db dyn Db,
+        env: &'a ProgramEnvironment<'db>,
+        holds: Option<bool>,
+    ) -> impl Display + 'a {
+        let range_prefix = match holds {
+            Some(true) => "",
+            Some(false) => "¬",
+            None => "?",
+        };
+        std::fmt::from_fn(move |f| {
+            write!(
+                f,
+                "{range_prefix}({} ≤ {})",
+                self.bound.display(db, env),
+                self.typevar.identity(db).display(db),
+            )
+        })
+    }
+}
+
 /// Restricts a single typevar so that it is assignable to a concrete upper bound. (A concrete type
 /// is not a bare typevar. [`TypeVarRangeBound`] is used to model an assignability relationship
 /// between two typevars.)
@@ -177,6 +217,29 @@ pub(super) struct ConcreteUpperBound<'db> {
     pub(super) bound: Type<'db>,
 }
 
+impl<'db> ConcreteUpperBound<'db> {
+    fn display<'a>(
+        self,
+        db: &'db dyn Db,
+        env: &'a ProgramEnvironment<'db>,
+        holds: Option<bool>,
+    ) -> impl Display + 'a {
+        let range_prefix = match holds {
+            Some(true) => "",
+            Some(false) => "¬",
+            None => "?",
+        };
+        std::fmt::from_fn(move |f| {
+            write!(
+                f,
+                "{range_prefix}({} ≤ {})",
+                self.typevar.identity(db).display(db),
+                self.bound.display(db, env),
+            )
+        })
+    }
+}
+
 /// Restricts a single typevar so that it is equivalent to some concrete type. (A concrete type is
 /// not a bare typevar. [`TypeVarEquivalenceBound`] is used to model an equivalence relationship
 /// between two typevars.)
@@ -187,12 +250,53 @@ pub(super) struct ConcreteEquivalenceBound<'db> {
     pub(super) bound: Type<'db>,
 }
 
+impl<'db> ConcreteEquivalenceBound<'db> {
+    fn display<'a>(
+        self,
+        db: &'db dyn Db,
+        env: &'a ProgramEnvironment<'db>,
+        holds: Option<bool>,
+    ) -> impl Display + 'a {
+        let equality_sign = match holds {
+            Some(true) => "=",
+            Some(false) => "≠",
+            None => "=?",
+        };
+        std::fmt::from_fn(move |f| {
+            write!(
+                f,
+                "({} {equality_sign} {})",
+                self.typevar.identity(db).display(db),
+                self.bound.display(db, env),
+            )
+        })
+    }
+}
+
 /// Restricts two typevars so that `left` must be assignable to `right`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) struct TypeVarRangeBound<'db> {
     pub(super) provenance: ConstraintProvenance,
     pub(super) left: BoundTypeVarInstance<'db>,
     pub(super) right: BoundTypeVarInstance<'db>,
+}
+
+impl<'db> TypeVarRangeBound<'db> {
+    fn display(self, db: &'db dyn Db, holds: Option<bool>) -> impl Display {
+        let range_prefix = match holds {
+            Some(true) => "",
+            Some(false) => "¬",
+            None => "?",
+        };
+        std::fmt::from_fn(move |f| {
+            write!(
+                f,
+                "{range_prefix}({} ≤ {})",
+                self.left.identity(db).display(db),
+                self.right.identity(db).display(db),
+            )
+        })
+    }
 }
 
 /// Restricts two typevars so that `left` must be equivalent to `right`.
@@ -223,5 +327,21 @@ impl<'db> TypeVarEquivalenceBound<'db> {
             left,
             right,
         }
+    }
+
+    fn display(self, db: &'db dyn Db, holds: Option<bool>) -> impl Display {
+        let equality_sign = match holds {
+            Some(true) => "=",
+            Some(false) => "≠",
+            None => "=?",
+        };
+        std::fmt::from_fn(move |f| {
+            write!(
+                f,
+                "({} {equality_sign} {})",
+                self.left.identity(db).display(db),
+                self.right.identity(db).display(db),
+            )
+        })
     }
 }
