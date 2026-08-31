@@ -7,18 +7,20 @@ use smallvec::SmallVec;
 
 use crate::types::constraints::variables::{
     ConcreteEquivalenceBound, ConcreteLowerBound, ConcreteUpperBound, Constraint,
+    ConstraintProvenance, ProvidesConcreteBound, ProvidesConcreteLowerBound,
+    ProvidesConcreteUpperBound, ProvidesTypeVarEquivalenceBound, ProvidesTypeVarRangeBound,
     TypeVarEquivalenceBound, TypeVarRangeBound,
 };
 use crate::types::constraints::{
     ALWAYS_FALSE, ALWAYS_TRUE, ConstraintBound, ConstraintBounds, ConstraintId,
-    ConstraintSetBuilder, ConstraintSetStorage, IntersectionResult, Node,
+    ConstraintSetBuilder, ConstraintSetStorage, IntersectionResult, Node, OwnedConstraintSet,
 };
 use crate::types::typevar::TypeVarSet;
 use crate::types::variance::VarianceInferable;
 use crate::types::visitor::{
     TypeCollector, TypeVisitor, any_over_type, walk_type_with_recursion_guard,
 };
-use crate::types::{BoundTypeVarInstance, Type, TypeVarVariance};
+use crate::types::{BoundTypeVarInstance, IntersectionType, Type, TypeVarVariance, UnionType};
 use crate::{Db, Program, ProgramEnvironment};
 
 /// A collection of _sequents_ that describe how the constraints mentioned in a BDD relate to each
@@ -1368,6 +1370,35 @@ impl<'db> SequentMap<Constraint<'db>> {
         self.sequents.push(Sequent::SingleTautology { ante });
     }
 
+    fn add_pair_impossibility(&mut self, ante1: Constraint<'db>, ante2: Constraint<'db>) {
+        self.sequents
+            .push(Sequent::PairImpossibility { ante1, ante2 });
+    }
+
+    #[expect(unused)]
+    fn add_triple_impossibility(
+        &mut self,
+        ante1: Constraint<'db>,
+        ante2: Constraint<'db>,
+        ante3: Constraint<'db>,
+    ) {
+        self.sequents.push(Sequent::TripleImpossibility {
+            ante1,
+            ante2,
+            ante3,
+        });
+    }
+
+    fn add_pair_implication(
+        &mut self,
+        ante1: Constraint<'db>,
+        ante2: Constraint<'db>,
+        post: Constraint<'db>,
+    ) {
+        self.sequents
+            .push(Sequent::PairImplication { ante1, ante2, post });
+    }
+
     fn add_single_implication(&mut self, ante: Constraint<'db>, post: Constraint<'db>) {
         self.sequents
             .push(Sequent::SingleImplication { ante, post });
@@ -1400,6 +1431,40 @@ impl<'db> SequentMap<Constraint<'db>> {
 
         for_constraint_inner(db, env.program(db), constraint)
     }
+
+    /// Returns a sequent map containing the sequents that we can infer from a pair of constraints.
+    /// This method is cached so that we only perform this work once per constraint pair.
+    ///
+    /// (Note that this method is _not_ commutative; you should provide `left` and `right` in the
+    /// order that they appear in the source code, so that we can construct derived constraints
+    /// that retain that ordering.)
+    pub(super) fn for_constraint_pair(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        left: Constraint<'db>,
+        right: Constraint<'db>,
+    ) -> &'db Self {
+        #[salsa::tracked(returns(ref))]
+        fn for_constraint_pair_inner<'db>(
+            db: &'db dyn Db,
+            program: Program<'db>,
+            left: Constraint<'db>,
+            right: Constraint<'db>,
+        ) -> SequentMap<Constraint<'db>> {
+            let env = &ProgramEnvironment::from_program(program);
+            tracing::trace!(
+                target: "ty_python_semantic::types::constraints::SequentMap",
+                left = %left.display(db, env, Some(true)),
+                right = %right.display(db, env, Some(true)),
+                "add sequents for constraint pair",
+            );
+            let mut map = SequentMap::<Constraint<'db>>::default();
+            left.add_sequents_with(db, env, &mut map, right);
+            map
+        }
+
+        for_constraint_pair_inner(db, env.program(db), left, right)
+    }
 }
 
 impl<'db> Constraint<'db> {
@@ -1411,6 +1476,643 @@ impl<'db> Constraint<'db> {
             Constraint::TypeVarRange(this) => this.add_sequents(db, map),
             Constraint::TypeVarEquivalence(this) => this.add_sequents(db, map),
         }
+    }
+
+    fn add_sequents_with(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: Self,
+    ) {
+        match (self, other) {
+            (Constraint::ConcreteLower(this), Constraint::ConcreteLower(other)) => {
+                this.add_sequents_with_concrete_lower(db, env, map, other, false);
+            }
+            (Constraint::ConcreteLower(this), Constraint::ConcreteUpper(other)) => {
+                this.add_sequents_with_concrete_upper(db, env, map, other, false);
+            }
+            (Constraint::ConcreteUpper(other), Constraint::ConcreteLower(this)) => {
+                this.add_sequents_with_concrete_upper(db, env, map, other, true);
+            }
+            (Constraint::ConcreteLower(this), Constraint::ConcreteEquivalence(other)) => {
+                this.add_sequents_with_concrete_equivalence(db, env, map, other, false);
+            }
+            (Constraint::ConcreteEquivalence(other), Constraint::ConcreteLower(this)) => {
+                this.add_sequents_with_concrete_equivalence(db, env, map, other, true);
+            }
+            (Constraint::ConcreteLower(this), Constraint::TypeVarRange(other)) => {
+                this.add_sequents_with_typevar_range(db, env, map, other, false);
+            }
+            (Constraint::TypeVarRange(other), Constraint::ConcreteLower(this)) => {
+                this.add_sequents_with_typevar_range(db, env, map, other, true);
+            }
+            (Constraint::ConcreteLower(this), Constraint::TypeVarEquivalence(other)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, false);
+            }
+            (Constraint::TypeVarEquivalence(other), Constraint::ConcreteLower(this)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, true);
+            }
+
+            (Constraint::ConcreteUpper(this), Constraint::ConcreteUpper(other)) => {
+                this.add_sequents_with_concrete_upper(db, env, map, other, false);
+            }
+            (Constraint::ConcreteUpper(this), Constraint::ConcreteEquivalence(other)) => {
+                this.add_sequents_with_concrete_equivalence(db, env, map, other, false);
+            }
+            (Constraint::ConcreteEquivalence(other), Constraint::ConcreteUpper(this)) => {
+                this.add_sequents_with_concrete_equivalence(db, env, map, other, true);
+            }
+            (Constraint::ConcreteUpper(this), Constraint::TypeVarRange(other)) => {
+                this.add_sequents_with_typevar_range(db, env, map, other, false);
+            }
+            (Constraint::TypeVarRange(other), Constraint::ConcreteUpper(this)) => {
+                this.add_sequents_with_typevar_range(db, env, map, other, true);
+            }
+            (Constraint::ConcreteUpper(this), Constraint::TypeVarEquivalence(other)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, false);
+            }
+            (Constraint::TypeVarEquivalence(other), Constraint::ConcreteUpper(this)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, true);
+            }
+
+            (Constraint::ConcreteEquivalence(this), Constraint::ConcreteEquivalence(other)) => {
+                this.add_sequents_with_concrete_equivalence(db, env, map, other, false);
+            }
+            (Constraint::ConcreteEquivalence(this), Constraint::TypeVarRange(other)) => {
+                this.add_sequents_with_typevar_range(db, env, map, other, false);
+            }
+            (Constraint::TypeVarRange(other), Constraint::ConcreteEquivalence(this)) => {
+                this.add_sequents_with_typevar_range(db, env, map, other, true);
+            }
+            (Constraint::ConcreteEquivalence(this), Constraint::TypeVarEquivalence(other)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, false);
+            }
+            (Constraint::TypeVarEquivalence(other), Constraint::ConcreteEquivalence(this)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, true);
+            }
+
+            (Constraint::TypeVarRange(this), Constraint::TypeVarRange(other)) => {
+                this.add_sequents_with_typevar_range(db, env, map, other, false);
+            }
+            (Constraint::TypeVarRange(this), Constraint::TypeVarEquivalence(other)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, false);
+            }
+            (Constraint::TypeVarEquivalence(other), Constraint::TypeVarRange(this)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, true);
+            }
+
+            (Constraint::TypeVarEquivalence(this), Constraint::TypeVarEquivalence(other)) => {
+                this.add_sequents_with_typevar_equivalence(db, env, map, other, false);
+            }
+        }
+    }
+
+    fn add_sequents_for_range(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        lower_constraint: Self,
+        lower_bound: Type<'db>,
+        upper_constraint: Self,
+        upper_bound: Type<'db>,
+    ) {
+        // Given constraints `α ≤ T` and `T ≤ β`, `α ≤ β` must also hold. If those bounds contain
+        // other typevars, we can infer additional constraints. (α and U won't be bare typevars,
+        // since those will be modeled by `TypeVarRange` bounds.)
+        //
+        //   1. `(Covariant[S] ≤ T) ∧ (T ≤ Covariant[U]) → (S ≤ U)`
+        //      `(Covariant[S] ≤ T) ∧ (T ≤ Covariant[τ]) → (S ≤ τ)`
+        //      `(Covariant[τ] ≤ T) ∧ (T ≤ Covariant[U]) → (τ ≤ U)`
+        //
+        //   2. `(Contravariant[S] ≤ T) ∧ (T ≤ Contravariant[U]) → (U ≤ S)`
+        //      `(Contravariant[S] ≤ T) ∧ (T ≤ Contravariant[τ]) → (τ ≤ S)`
+        //      `(Contravariant[τ] ≤ T) ∧ (T ≤ Contravariant[U]) → (U ≤ τ)`
+        //
+        //   3. `(Invariant[S] ≤ T) ∧ (T ≤ Invariant[U]) → (S = U)`
+        //      `(Invariant[S] ≤ T) ∧ (T ≤ Invariant[τ]) → (S = τ)`
+        //      `(Invariant[τ] ≤ T) ∧ (T ≤ Invariant[U]) → (τ = U)`
+        //
+        // and whenever the bounds are assignable, even if they don't mention exactly the same
+        // types:
+        //
+        //   class Sub(Covariant[int]): ...
+        //
+        //   4. `(Covariant[S] ≤ T ≤ Sub) → (S ≤ int)`
+        //      `(Sub ≤ T ≤ Covariant[U]) → (int ≤ U)`
+        //
+        // To handle all of these cases, we perform a constraint set assignability check to see
+        // when `α ≤ β`. This gives us a constraint set, which should be the rhs of the sequent
+        // implication. (That is, this check directly encodes `(α ≤ T) ∧ (T ≤ β) → (α ≤ β)` as an
+        // implication.)
+
+        // Skip trivial cases where the assignability check won't produce useful results.
+        if lower_bound.is_never() || upper_bound.is_object() {
+            return;
+        }
+
+        let when = lower_bound.when_constraint_set_assignable_to_owned(db, env, upper_bound);
+        Self::add_constraint_set_implication(
+            map,
+            lower_constraint,
+            upper_constraint,
+            when.as_ref(),
+        );
+    }
+
+    fn add_sequents_for_equivalence(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        lower_constraint: Self,
+        lower_bound: Type<'db>,
+        upper_constraint: Self,
+        upper_bound: Type<'db>,
+    ) {
+        // Given constraints `T = α` and `T = β`, `α = β` must also hold. If those bounds contain
+        // other typevars, we can infer additional constraints.
+
+        let when = lower_bound.when_constraint_set_equivalent_to_owned(db, env, upper_bound);
+        Self::add_constraint_set_implication(
+            map,
+            lower_constraint,
+            upper_constraint,
+            when.as_ref(),
+        );
+    }
+
+    fn add_constraint_set_implication(
+        map: &mut SequentMap<Constraint<'db>>,
+        lower_constraint: Self,
+        upper_constraint: Self,
+        when: &OwnedConstraintSet<'db>,
+    ) {
+        when.query(|builder, when| {
+            // If the relation _never_ holds, these constraints are contradictory.
+            if when.is_trivially_never_satisfied() {
+                map.add_pair_impossibility(lower_constraint, upper_constraint);
+                return;
+            }
+
+            // Fast path: If the relation _always_, there are no derived constraints
+            // that we can infer. This would be handled correctly by the logic below, but this is a
+            // useful early return. Since we only use this check as an early return happy path, we can
+            // accept false negatives. That lets us use the simpler and cheaper check against
+            // ALWAYS_TRUE, rather than a more expensive is_always_satisfiable call.
+            if when.is_trivially_always_satisfied() {
+                return;
+            }
+
+            // Technically, we've just calculated a _constraint set_ as the rhs of this implication.
+            // Unfortunately, our sequent map can currently only store implications where the rhs is a
+            // single constraint.
+            //
+            // If the constraint set that we get represents a single conjunction, we can still shoehorn
+            // it into this shape, since we can "break apart" a conjunction on the rhs of an
+            // implication:
+            //
+            //   a → b ∧ c ∧ d
+            //
+            // becomes
+            //
+            //   a → b
+            //   a → c
+            //   a → d
+            //
+            // That takes care of breaking apart the rhs conjunction: we can add each positive
+            // constraint as a separate single_implication.
+            //
+            // We can also handle _negative_ constraints, because those turn into impossibilities:
+            //
+            //   a → ¬b
+            //
+            // becomes
+            //
+            //   a ∧ b → false
+            //
+            // TODO: This should handle the most common cases. In the future, we could handle arbitrary
+            // rhs constraint sets by moving this logic into PathAssignments::walk_path, and performing
+            // it once for _every_ root→always path in the BDD. (That would require resetting the
+            // PathAssignments state for each of those paths, which is why the logic would have to
+            // move.)
+            let mut storage = builder.storage.borrow_mut();
+            let mut node = when.node;
+            if !node.is_single_conjunction(&mut storage) {
+                return;
+            }
+
+            loop {
+                match node.node() {
+                    Node::AlwaysTrue | Node::AlwaysFalse => break,
+                    Node::Interior(interior) => {
+                        let interior = storage.interior_node_data(interior.node());
+                        // XXX
+                        let derived = upper_constraint;
+                        /*
+                        let derived = storage.constraint_data(interior.constraint);
+                        let derived =
+                            ConstraintId::new_with_bounds(
+                                db,
+                                env,
+                                storage,
+                                derived.typevar,
+                                derived.bounds.lower.map(|bound| {
+                                    bound.with_source_provenance(constraint_data.bounds)
+                                }),
+                                derived.bounds.upper.map(|bound| {
+                                    bound.with_source_provenance(constraint_data.bounds)
+                                }),
+                            );
+                        */
+                        if interior.if_true != ALWAYS_FALSE {
+                            map.add_pair_implication(lower_constraint, upper_constraint, derived);
+                            node = interior.if_true;
+                        } else {
+                            map.add_triple_impossibility(
+                                lower_constraint,
+                                upper_constraint,
+                                derived,
+                            );
+                            node = interior.if_false;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn add_covariant_lower_tightened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: impl ProvidesConcreteLowerBound<'db>,
+        right: impl ProvidesConcreteLowerBound<'db>,
+    ) {
+        let left_constraint = left.constraint();
+        let left = left.into_lower_bound();
+        let right_constraint = right.constraint();
+        let right = right.into_lower_bound();
+
+        // Given `α ≤ T` and `β ≤ U`, if α contains U covariantly, we can substitute β for U:
+        //
+        //   (Co[U] ≤ T) ∧ (β ≤ U) ⇒ (Co[β] ≤ T)
+        if left.bound.variance_of(db, env, right.typevar.identity(db)) != TypeVarVariance::Covariant
+        {
+            return;
+        }
+        let replacement = left
+            .bound
+            .substitute_one_typevar(db, env, right.typevar, right.bound);
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance),
+            replacement,
+        );
+        map.add_pair_implication(left_constraint, right_constraint, derived.constraint());
+    }
+
+    fn add_covariant_upper_tightened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: impl ProvidesConcreteUpperBound<'db>,
+        right: impl ProvidesConcreteUpperBound<'db>,
+    ) {
+        let left_constraint = left.constraint();
+        let left = left.into_upper_bound();
+        let right_constraint = right.constraint();
+        let right = right.into_upper_bound();
+
+        // Given `T ≤ α` and `U ≤ β`, if α contains U covariantly, we can substitute β for U:
+        //
+        //   (T ≤ Co[U]) ∧ (U ≤ β) ⇒ (T ≤ Co[β])
+        if left.bound.variance_of(db, env, right.typevar.identity(db)) != TypeVarVariance::Covariant
+        {
+            return;
+        }
+        let replacement = left
+            .bound
+            .substitute_one_typevar(db, env, right.typevar, right.bound);
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance),
+            replacement,
+        );
+        map.add_pair_implication(left_constraint, right_constraint, derived.constraint());
+    }
+
+    fn add_covariant_equivalence_tightened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: ConcreteEquivalenceBound<'db>,
+        right: ConcreteEquivalenceBound<'db>,
+    ) {
+        // Given `T = α` and `U = β`, if α contains U covariantly, we can substitute β for U:
+        //
+        //   (T = Co[U]) ∧ (U = β) ⇒ (T = Co[β])
+        if left.bound.variance_of(db, env, right.typevar.identity(db)) != TypeVarVariance::Covariant
+        {
+            return;
+        }
+        let replacement = left
+            .bound
+            .substitute_one_typevar(db, env, right.typevar, right.bound);
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance),
+            replacement,
+        );
+        map.add_pair_implication(left.constraint(), right.constraint(), derived.constraint());
+    }
+
+    fn add_contravariant_tightened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        lower: impl ProvidesConcreteLowerBound<'db>,
+        upper: impl ProvidesConcreteUpperBound<'db>,
+    ) {
+        let lower_constraint = lower.constraint();
+        let lower = lower.into_lower_bound();
+        let upper_constraint = upper.constraint();
+        let upper = upper.into_upper_bound();
+        let provenance = ConstraintProvenance::derived(lower.provenance, upper.provenance);
+
+        // Given `α ≤ T` and `U ≤ β`, if α contains U contravariantly, substitute β for U:
+        //
+        //   (Contra[U] ≤ T) ∧ (U ≤ β) ⇒ (Contra[β] ≤ T)
+        if lower.bound.variance_of(db, env, upper.typevar.identity(db))
+            == TypeVarVariance::Contravariant
+        {
+            let replacement =
+                lower
+                    .bound
+                    .substitute_one_typevar(db, env, upper.typevar, upper.bound);
+            let derived = lower.map(provenance, replacement);
+            map.add_pair_implication(lower_constraint, upper_constraint, derived.constraint());
+        }
+
+        // If β contains T contravariantly, substitute α for T:
+        //
+        //   (α ≤ T) ∧ (U ≤ Contra[T]) ⇒ (U ≤ Contra[α])
+        if upper.bound.variance_of(db, env, lower.typevar.identity(db))
+            == TypeVarVariance::Contravariant
+        {
+            let replacement =
+                upper
+                    .bound
+                    .substitute_one_typevar(db, env, lower.typevar, lower.bound);
+            let derived = upper.map(provenance, replacement);
+            map.add_pair_implication(lower_constraint, upper_constraint, derived.constraint());
+        }
+    }
+
+    fn add_invariant_tightened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: impl ProvidesConcreteBound<'db>,
+        right: ConcreteEquivalenceBound<'db>,
+    ) {
+        // Given `T ~ α` and `U = β`, if α contains U invariantly, we can substitute β for U. For
+        // instance,
+        //
+        //   (T ~ In[U]) ∧ (U = β) ⇒ (T ~ In[β])
+        if left
+            .bound()
+            .variance_of(db, env, right.typevar.identity(db))
+            != TypeVarVariance::Invariant
+        {
+            return;
+        }
+        let replacement = left
+            .bound()
+            .substitute_one_typevar(db, env, right.typevar, right.bound);
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance(), right.provenance),
+            replacement,
+        );
+        map.add_pair_implication(left.constraint(), right.constraint(), derived.constraint());
+    }
+
+    fn add_covariant_lower_weakened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: impl ProvidesConcreteLowerBound<'db>,
+        right: impl ProvidesTypeVarRangeBound<'db>,
+    ) {
+        let left_constraint = left.constraint();
+        let left = left.into_lower_bound();
+
+        // Given `α ≤ T` and `S ≤ U`, if α contains U covariantly, we can substitute S for U. For
+        // instance,
+        //
+        //   (Co[U] ≤ T) ∧ (S ≤ U) ⇒ (Co[S] ≤ T)
+        if left.bound.variance_of(db, env, right.right().identity(db)) != TypeVarVariance::Covariant
+        {
+            return;
+        }
+        let replacement =
+            left.bound
+                .substitute_one_typevar(db, env, right.right(), Type::TypeVar(right.left()));
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance()),
+            replacement,
+        );
+        map.add_pair_implication(left_constraint, right.constraint(), derived.constraint());
+    }
+
+    fn add_covariant_upper_weakened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: impl ProvidesConcreteUpperBound<'db>,
+        right: impl ProvidesTypeVarRangeBound<'db>,
+    ) {
+        let left_constraint = left.constraint();
+        let left = left.into_upper_bound();
+
+        // Given `T ≤ α` and `U ≤ S`, if α contains U covariantly, we can substitute S for U. For
+        // instance,
+        //
+        //   (T ≤ Co[U]) ∧ (U ≤ S) ⇒ (T ≤ Co[S])
+        if left.bound.variance_of(db, env, right.left().identity(db)) != TypeVarVariance::Covariant
+        {
+            return;
+        }
+        let replacement =
+            left.bound
+                .substitute_one_typevar(db, env, right.left(), Type::TypeVar(right.right()));
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance()),
+            replacement,
+        );
+        map.add_pair_implication(left_constraint, right.constraint(), derived.constraint());
+    }
+
+    fn add_covariant_equivalence_weakened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: ConcreteEquivalenceBound<'db>,
+        right: impl ProvidesTypeVarEquivalenceBound<'db>,
+    ) {
+        // Given `T = α` and `S = U`, if α contains S covariantly, we can substitute U for S. For
+        // instance,
+        //
+        //   (T = Co[S]) ∧ (S = U) ⇒ (T = Co[U])
+        if left.bound.variance_of(db, env, right.left().identity(db)) != TypeVarVariance::Covariant
+        {
+            return;
+        }
+        let replacement =
+            left.bound
+                .substitute_one_typevar(db, env, right.left(), Type::TypeVar(right.right()));
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance()),
+            replacement,
+        );
+        map.add_pair_implication(left.constraint(), right.constraint(), derived.constraint());
+    }
+
+    fn add_contravariant_lower_weakened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: impl ProvidesConcreteLowerBound<'db>,
+        right: impl ProvidesTypeVarRangeBound<'db>,
+    ) {
+        let left_constraint = left.constraint();
+        let left = left.into_lower_bound();
+
+        // Given `α ≤ T` and `U ≤ S`, if α contains U contravariantly, we can substitute S for U
+        // and flip the constraint. For instance,
+        //
+        //   (Contra[U] ≤ T) ∧ (U ≤ S) ⇒ (Contra[S] ≤ T)
+        if left.bound.variance_of(db, env, right.left().identity(db))
+            != TypeVarVariance::Contravariant
+        {
+            return;
+        }
+        let replacement =
+            left.bound
+                .substitute_one_typevar(db, env, right.left(), Type::TypeVar(right.right()));
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance()),
+            replacement,
+        );
+        map.add_pair_implication(left_constraint, right.constraint(), derived.constraint());
+    }
+
+    fn add_contravariant_upper_weakened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: impl ProvidesConcreteUpperBound<'db>,
+        right: impl ProvidesTypeVarRangeBound<'db>,
+    ) {
+        let left_constraint = left.constraint();
+        let left = left.into_upper_bound();
+
+        // Given `T ≤ α` and `S ≤ U`, if α contains U contravariantly, we can substitute S for U
+        // and flip the constraint. For instance,
+        //
+        //   (T ≤ Contra[U]) ∧ (S ≤ U) ⇒ (T ≤ Contra[S])
+        if left.bound.variance_of(db, env, right.right().identity(db))
+            != TypeVarVariance::Contravariant
+        {
+            return;
+        }
+        let replacement =
+            left.bound
+                .substitute_one_typevar(db, env, right.right(), Type::TypeVar(right.left()));
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance()),
+            replacement,
+        );
+        map.add_pair_implication(left_constraint, right.constraint(), derived.constraint());
+    }
+
+    fn add_contravariant_equivalence_weakened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: ConcreteEquivalenceBound<'db>,
+        right: impl ProvidesTypeVarEquivalenceBound<'db>,
+    ) {
+        // Given `T = α` and `S = U`, if α contains U contravariantly, we can substitute S for U
+        // and flip the constraint. For instance,
+        //
+        //   (T = Contra[U]) ∧ (S = U) ⇒ (T = Contra[S])
+        if left.bound.variance_of(db, env, right.left().identity(db))
+            != TypeVarVariance::Contravariant
+        {
+            return;
+        }
+        let replacement =
+            left.bound
+                .substitute_one_typevar(db, env, right.left(), Type::TypeVar(right.right()));
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance, right.provenance()),
+            replacement,
+        );
+        map.add_pair_implication(left.constraint(), right.constraint(), derived.constraint());
+    }
+
+    fn add_invariant_weakened_sequent(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        left: impl ProvidesConcreteBound<'db>,
+        right: impl ProvidesTypeVarEquivalenceBound<'db>,
+    ) {
+        // Given `T ~ α` and `S = U`, if α contains U invariantly, we can substitute S for U. For
+        // instance,
+        //
+        //   (T ~ In[U]) ∧ (S = U) ⇒ (T ~ In[S])
+        if left.bound().variance_of(db, env, right.left().identity(db))
+            != TypeVarVariance::Invariant
+        {
+            return;
+        }
+        let replacement = left.bound().substitute_one_typevar(
+            db,
+            env,
+            right.left(),
+            Type::TypeVar(right.right()),
+        );
+        let derived = left.map(
+            ConstraintProvenance::derived(left.provenance(), right.provenance()),
+            replacement,
+        );
+        map.add_pair_implication(left.constraint(), right.constraint(), derived.constraint());
+    }
+}
+
+fn possibly_reversed_intersection<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    reversed: bool,
+    left: Type<'db>,
+    right: Type<'db>,
+) -> Type<'db> {
+    if reversed {
+        IntersectionType::from_two_elements(db, env, right, left)
+    } else {
+        IntersectionType::from_two_elements(db, env, left, right)
+    }
+}
+
+fn possibly_reversed_union<'db>(
+    db: &'db dyn Db,
+    env: &ProgramEnvironment<'db>,
+    reversed: bool,
+    left: Type<'db>,
+    right: Type<'db>,
+) -> Type<'db> {
+    if reversed {
+        UnionType::from_two_elements(db, env, right, left)
+    } else {
+        UnionType::from_two_elements(db, env, left, right)
     }
 }
 
@@ -1434,6 +2136,234 @@ impl<'db> ConcreteLowerBound<'db> {
             );
         }
     }
+
+    fn add_sequents_with_concrete_lower(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: ConcreteLowerBound<'db>,
+        reversed: bool,
+    ) {
+        // We can infer sequents from `α ≤ T` and `β ≤ U` if α _contains_ U and/or β contains T.
+        if !self.typevar.is_same_typevar_as(db, other.typevar) {
+            Constraint::add_covariant_lower_tightened_sequent(db, env, map, self, other);
+            Constraint::add_covariant_lower_tightened_sequent(db, env, map, other, self);
+            return;
+        }
+
+        // These might seem redundant with the union calculation check below, since `a → b` means
+        // that `a ∧ b = a`. But we are not normalizing constraint bounds, and these clauses help
+        // us identify constraints that are identical besides e.g. ordering of union/intersection
+        // elements. (For instance, when processing `τ₁ & τ₂ ≤ T` and `τ₂ & τ₁ ≤ T`, these clauses
+        // would add sequents for `(τ₁ & τ₂ ≤ T) → (τ₂ & τ₁ ≤ T)` and vice versa.)
+
+        // (β ≤ α) ⇒ ((α ≤ T) ⇒ (β ≤ T))
+        if other
+            .bound
+            .is_constraint_set_assignable_to(db, env, self.bound)
+        {
+            map.add_single_implication(
+                Constraint::ConcreteLower(self),
+                Constraint::ConcreteLower(other),
+            );
+        }
+
+        // (α ≤ β) ⇒ ((β ≤ T) ⇒ (α ≤ T))
+        if self
+            .bound
+            .is_constraint_set_assignable_to(db, env, other.bound)
+        {
+            map.add_single_implication(
+                Constraint::ConcreteLower(other),
+                Constraint::ConcreteLower(self),
+            );
+        }
+
+        // `(α ≤ T) ∧ (β ≤ T)` is equivalent to `(α | β) ≤ T`. We do not create lower bounds that
+        // are unions, so only add sequents when the union simplifies away.
+        let combined = possibly_reversed_union(db, env, reversed, self.bound, other.bound);
+        if !combined.is_union() {
+            let combined = ConcreteLowerBound {
+                provenance: ConstraintProvenance::simplified(
+                    self.provenance,
+                    self.bound,
+                    other.provenance,
+                    other.bound,
+                    combined,
+                ),
+                typevar: self.typevar,
+                bound: combined,
+            };
+
+            // The result is an equivalence, so add implications in both directions.
+            map.add_pair_implication(
+                Constraint::ConcreteLower(self),
+                Constraint::ConcreteLower(other),
+                Constraint::ConcreteLower(combined),
+            );
+            map.add_single_implication(
+                Constraint::ConcreteLower(combined),
+                Constraint::ConcreteLower(self),
+            );
+            map.add_single_implication(
+                Constraint::ConcreteLower(combined),
+                Constraint::ConcreteLower(other),
+            );
+        }
+    }
+
+    fn add_sequents_with_concrete_upper(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: ConcreteUpperBound<'db>,
+        _reversed: bool,
+    ) {
+        // We can infer sequents from `α ≤ T` and `U ≤ β` if α _contains_ U and/or β contains T.
+        if !self.typevar.is_same_typevar_as(db, other.typevar) {
+            Constraint::add_contravariant_tightened_sequent(db, env, map, self, other);
+            return;
+        }
+
+        // `(α ≤ T) ∧ (T ≤ β)` simplifies to `T = α` when `α = β`. (We don't need to add the
+        // projection implication `(T = α) ⇒ (α ≤ T)`, since anything we can derive from `α ≤ T` we
+        // can also derive from `T = α`.)
+        let lower = self.bound;
+        let upper = other.bound;
+        if lower.is_constraint_set_equivalent_to(db, env, upper) {
+            let simplified = ConcreteEquivalenceBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                typevar: self.typevar,
+                bound: lower,
+            };
+            map.add_pair_implication(
+                Constraint::ConcreteLower(self),
+                Constraint::ConcreteUpper(other),
+                Constraint::ConcreteEquivalence(simplified),
+            );
+            return;
+        }
+
+        // Given constraints `α ≤ T` and `T ≤ β`, `α ≤ β` must also hold. If those bounds contain
+        // other typevars, we can infer additional constraints.
+        Constraint::add_sequents_for_range(
+            db,
+            env,
+            map,
+            Constraint::ConcreteLower(self),
+            self.bound,
+            Constraint::ConcreteUpper(other),
+            other.bound,
+        );
+    }
+
+    fn add_sequents_with_concrete_equivalence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: ConcreteEquivalenceBound<'db>,
+        _reversed: bool,
+    ) {
+        // We can infer sequents from `α ≤ T` and `U = β` if α _contains_ U and/or β contains T.
+        if !self.typevar.is_same_typevar_as(db, other.typevar) {
+            Constraint::add_covariant_lower_tightened_sequent(db, env, map, self, other);
+            Constraint::add_covariant_lower_tightened_sequent(db, env, map, other, self);
+            Constraint::add_contravariant_tightened_sequent(db, env, map, self, other);
+            Constraint::add_invariant_tightened_sequent(db, env, map, self, other);
+            return;
+        }
+
+        // (α ≤ β) ⇒ ((T = β) ⇒ (α ≤ T))
+        if self
+            .bound
+            .is_constraint_set_assignable_to(db, env, other.bound)
+        {
+            map.add_single_implication(
+                Constraint::ConcreteEquivalence(other),
+                Constraint::ConcreteLower(self),
+            );
+        }
+
+        // Given constraints `α ≤ T` and `T = β`, `α ≤ β` must also hold. If those bounds contain
+        // other typevars, we can infer additional constraints.
+        Constraint::add_sequents_for_range(
+            db,
+            env,
+            map,
+            Constraint::ConcreteLower(self),
+            self.bound,
+            Constraint::ConcreteEquivalence(other),
+            other.bound,
+        );
+    }
+
+    fn add_sequents_with_typevar_range(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarRangeBound<'db>,
+        _reversed: bool,
+    ) {
+        // Given constraints `α ≤ T` and `T ≤ U`, `α ≤ U` must also hold.
+        if self.typevar.is_same_typevar_as(db, other.left) {
+            let derived = ConcreteLowerBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                typevar: other.right,
+                bound: self.bound,
+            };
+            map.add_pair_implication(
+                Constraint::ConcreteLower(self),
+                Constraint::TypeVarRange(other),
+                Constraint::ConcreteLower(derived),
+            );
+        }
+
+        // We can infer sequents from `α ≤ T` and `S ≤ U` if α _contains_ U.
+        Constraint::add_covariant_lower_weakened_sequent(db, env, map, self, other);
+        Constraint::add_contravariant_lower_weakened_sequent(db, env, map, self, other);
+    }
+
+    fn add_sequents_with_typevar_equivalence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarEquivalenceBound<'db>,
+        _reversed: bool,
+    ) {
+        // Given constraints `α ≤ T` and `T = U`, `α ≤ U` must also hold.
+        let other_typevar = if self.typevar.is_same_typevar_as(db, other.left) {
+            Some(other.right)
+        } else if self.typevar.is_same_typevar_as(db, other.right) {
+            Some(other.left)
+        } else {
+            None
+        };
+        if let Some(other_typevar) = other_typevar {
+            let derived = ConcreteLowerBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                typevar: other_typevar,
+                bound: self.bound,
+            };
+            map.add_pair_implication(
+                Constraint::ConcreteLower(self),
+                Constraint::TypeVarEquivalence(other),
+                Constraint::ConcreteLower(derived),
+            );
+        }
+
+        // We can infer sequents from `α ≤ T` and `S ≤ U` if α _contains_ U.
+        Constraint::add_covariant_lower_weakened_sequent(db, env, map, self, other.forwards());
+        Constraint::add_covariant_lower_weakened_sequent(db, env, map, self, other.backwards());
+        Constraint::add_contravariant_lower_weakened_sequent(db, env, map, self, other.forwards());
+        Constraint::add_contravariant_lower_weakened_sequent(db, env, map, self, other.backwards());
+        Constraint::add_invariant_weakened_sequent(db, env, map, self, other.forwards());
+        Constraint::add_invariant_weakened_sequent(db, env, map, self, other.backwards());
+    }
 }
 
 impl<'db> ConcreteUpperBound<'db> {
@@ -1456,12 +2386,361 @@ impl<'db> ConcreteUpperBound<'db> {
             );
         }
     }
+
+    fn add_sequents_with_concrete_upper(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: ConcreteUpperBound<'db>,
+        reversed: bool,
+    ) {
+        // We can infer sequents from `T ≤ α` and `U ≤ β` if α _contains_ U and/or β contains T.
+        if !self.typevar.is_same_typevar_as(db, other.typevar) {
+            Constraint::add_covariant_upper_tightened_sequent(db, env, map, self, other);
+            Constraint::add_covariant_upper_tightened_sequent(db, env, map, other, self);
+            return;
+        }
+
+        // These might seem redundant with the intersection calculation check below, since `a → b`
+        // means that `a ∧ b = a`. But we are not normalizing constraint bounds, and these clauses
+        // help us identify constraints that are identical besides e.g. ordering of
+        // union/intersection elements. (For instance, when processing `T ≤ τ₁ | τ₂` and
+        // `T ≤ τ₂ | τ₁`, these clauses would add sequents for `(T ≤ τ₁ | τ₂) → (T ≤ τ₂ | τ₁)` and
+        // vice versa.)
+
+        // (α ≤ β) ⇒ ((T ≤ α) ⇒ (T ≤ β))
+        if self
+            .bound
+            .is_constraint_set_assignable_to(db, env, other.bound)
+        {
+            map.add_single_implication(
+                Constraint::ConcreteUpper(self),
+                Constraint::ConcreteUpper(other),
+            );
+        }
+
+        // (β ≤ α) ⇒ ((T ≤ β) ⇒ (T ≤ α))
+        if other
+            .bound
+            .is_constraint_set_assignable_to(db, env, self.bound)
+        {
+            map.add_single_implication(
+                Constraint::ConcreteUpper(other),
+                Constraint::ConcreteUpper(self),
+            );
+        }
+
+        // `(T ≤ α) ∧ (T ≤ β)` is equivalent to `T ≤ (α & β)`. We do not create upper bounds that
+        // are intersections, so only add sequents when the intersection simplifies away.
+        let combined = possibly_reversed_intersection(db, env, reversed, self.bound, other.bound);
+        if combined.is_nontrivial_intersection(db) {
+            return;
+        }
+
+        let combined = ConcreteUpperBound {
+            provenance: ConstraintProvenance::simplified(
+                self.provenance,
+                self.bound,
+                other.provenance,
+                other.bound,
+                combined,
+            ),
+            typevar: self.typevar,
+            bound: combined,
+        };
+
+        // The result is an equivalence, so add implications in both directions.
+        map.add_pair_implication(
+            Constraint::ConcreteUpper(self),
+            Constraint::ConcreteUpper(other),
+            Constraint::ConcreteUpper(combined),
+        );
+        map.add_single_implication(
+            Constraint::ConcreteUpper(combined),
+            Constraint::ConcreteUpper(self),
+        );
+        map.add_single_implication(
+            Constraint::ConcreteUpper(combined),
+            Constraint::ConcreteUpper(other),
+        );
+    }
+
+    fn add_sequents_with_concrete_equivalence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: ConcreteEquivalenceBound<'db>,
+        _reversed: bool,
+    ) {
+        // We can infer sequents from `T ≤ α` and `U = β` if α _contains_ U and/or β contains T.
+        if !self.typevar.is_same_typevar_as(db, other.typevar) {
+            Constraint::add_covariant_upper_tightened_sequent(db, env, map, self, other);
+            Constraint::add_covariant_upper_tightened_sequent(db, env, map, other, self);
+            Constraint::add_contravariant_tightened_sequent(db, env, map, other, self);
+            Constraint::add_invariant_tightened_sequent(db, env, map, self, other);
+            return;
+        }
+
+        // (β ≤ α) ⇒ ((T = β) ⇒ (T ≤ α))
+        if other
+            .bound
+            .is_constraint_set_assignable_to(db, env, self.bound)
+        {
+            map.add_single_implication(
+                Constraint::ConcreteEquivalence(other),
+                Constraint::ConcreteUpper(self),
+            );
+        }
+
+        // Given constraints `T ≤ α` and `T = β`, `α ≤ β` must also hold. If those bounds contain
+        // other typevars, we can infer additional constraints.
+        Constraint::add_sequents_for_range(
+            db,
+            env,
+            map,
+            Constraint::ConcreteEquivalence(other),
+            other.bound,
+            Constraint::ConcreteUpper(self),
+            self.bound,
+        );
+    }
+
+    fn add_sequents_with_typevar_range(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarRangeBound<'db>,
+        _reversed: bool,
+    ) {
+        // Given constraints `T ≤ α` and `U ≤ T`, `U ≤ α` must also hold.
+        if self.typevar.is_same_typevar_as(db, other.right) {
+            let derived = ConcreteUpperBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                typevar: other.left,
+                bound: self.bound,
+            };
+            map.add_pair_implication(
+                Constraint::ConcreteUpper(self),
+                Constraint::TypeVarRange(other),
+                Constraint::ConcreteUpper(derived),
+            );
+        }
+
+        // We can infer sequents from `T ≤ α` and `S ≤ U` if α _contains_ S.
+        Constraint::add_covariant_upper_weakened_sequent(db, env, map, self, other);
+        Constraint::add_contravariant_upper_weakened_sequent(db, env, map, self, other);
+    }
+
+    fn add_sequents_with_typevar_equivalence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarEquivalenceBound<'db>,
+        _reversed: bool,
+    ) {
+        // Given constraints `T ≤ α` and `U = T`, `U ≤ α` must also hold.
+        let other_typevar = if self.typevar.is_same_typevar_as(db, other.left) {
+            Some(other.right)
+        } else if self.typevar.is_same_typevar_as(db, other.right) {
+            Some(other.left)
+        } else {
+            None
+        };
+        if let Some(other_typevar) = other_typevar {
+            let derived = ConcreteUpperBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                typevar: other_typevar,
+                bound: self.bound,
+            };
+            map.add_pair_implication(
+                Constraint::ConcreteUpper(self),
+                Constraint::TypeVarEquivalence(other),
+                Constraint::ConcreteUpper(derived),
+            );
+        }
+
+        // We can infer sequents from `T ≤ α` and `S = U` if α _contains_ S.
+        Constraint::add_covariant_upper_weakened_sequent(db, env, map, self, other.forwards());
+        Constraint::add_covariant_upper_weakened_sequent(db, env, map, self, other.backwards());
+        Constraint::add_contravariant_upper_weakened_sequent(db, env, map, self, other.forwards());
+        Constraint::add_contravariant_upper_weakened_sequent(db, env, map, self, other.backwards());
+        Constraint::add_invariant_weakened_sequent(db, env, map, self, other.forwards());
+        Constraint::add_invariant_weakened_sequent(db, env, map, self, other.backwards());
+    }
 }
 
 impl<'db> ConcreteEquivalenceBound<'db> {
     #[expect(clippy::unused_self)]
     fn add_sequents(self, _db: &'db dyn Db, _map: &mut SequentMap<Constraint<'db>>) {
         // We cannot infer any sequents from `T = α` on its own.
+    }
+
+    fn add_sequents_with_concrete_equivalence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: ConcreteEquivalenceBound<'db>,
+        _reversed: bool,
+    ) {
+        // We can infer sequents from `T = α` and `U = β` if α _contains_ U and/or β contains T.
+        if !self.typevar.is_same_typevar_as(db, other.typevar) {
+            Constraint::add_covariant_equivalence_tightened_sequent(db, env, map, self, other);
+            Constraint::add_covariant_equivalence_tightened_sequent(db, env, map, other, self);
+            Constraint::add_contravariant_tightened_sequent(db, env, map, self, other);
+            Constraint::add_contravariant_tightened_sequent(db, env, map, other, self);
+            Constraint::add_invariant_tightened_sequent(db, env, map, self, other);
+            Constraint::add_invariant_tightened_sequent(db, env, map, other, self);
+            return;
+        }
+
+        // Given `T = α` and `T = β`, if α and β are equivalent (but not _identical_), we can infer
+        // either from the other.
+        if self.bound == other.bound {
+            return;
+        }
+        if self
+            .bound
+            .is_constraint_set_equivalent_to(db, env, other.bound)
+        {
+            let provenance = ConstraintProvenance::derived(self.provenance, other.provenance);
+
+            let derived = ConcreteEquivalenceBound {
+                provenance,
+                ..other
+            };
+            map.add_single_implication(
+                Constraint::ConcreteEquivalence(self),
+                Constraint::ConcreteEquivalence(derived),
+            );
+
+            let derived = ConcreteEquivalenceBound { provenance, ..self };
+            map.add_single_implication(
+                Constraint::ConcreteEquivalence(other),
+                Constraint::ConcreteEquivalence(derived),
+            );
+        }
+
+        // Given constraints `T = α` and `T = β`, `α = β` must also hold. If those bounds contain
+        // other typevars, we can infer additional constraints.
+        Constraint::add_sequents_for_equivalence(
+            db,
+            env,
+            map,
+            Constraint::ConcreteEquivalence(self),
+            self.bound,
+            Constraint::ConcreteEquivalence(other),
+            other.bound,
+        );
+    }
+
+    fn add_sequents_with_typevar_range(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarRangeBound<'db>,
+        _reversed: bool,
+    ) {
+        // Given constraints `T = α` and `T ≤ U`, `α ≤ U` must also hold.
+        if self.typevar.is_same_typevar_as(db, other.left) {
+            let derived = ConcreteLowerBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                typevar: other.right,
+                bound: self.bound,
+            };
+            map.add_pair_implication(
+                Constraint::ConcreteEquivalence(self),
+                Constraint::TypeVarRange(other),
+                Constraint::ConcreteLower(derived),
+            );
+        }
+
+        // Given constraints `T = α` and `U ≤ T`, `U ≤ α` must also hold.
+        if self.typevar.is_same_typevar_as(db, other.right) {
+            let derived = ConcreteUpperBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                typevar: other.left,
+                bound: self.bound,
+            };
+            map.add_pair_implication(
+                Constraint::ConcreteEquivalence(self),
+                Constraint::TypeVarRange(other),
+                Constraint::ConcreteUpper(derived),
+            );
+        }
+
+        // We can infer sequents from `T = α` and `S ≤ U` if α _contains_ U.
+        Constraint::add_covariant_lower_weakened_sequent(db, env, map, self, other);
+        Constraint::add_covariant_upper_weakened_sequent(db, env, map, self, other);
+        Constraint::add_contravariant_lower_weakened_sequent(db, env, map, self, other);
+        Constraint::add_contravariant_upper_weakened_sequent(db, env, map, self, other);
+    }
+
+    fn add_sequents_with_typevar_equivalence(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarEquivalenceBound<'db>,
+        _reversed: bool,
+    ) {
+        // Given constraints `T = α` and `T = U`, `U = α` must also hold.
+        let other_typevar = if self.typevar.is_same_typevar_as(db, other.left) {
+            Some(other.right)
+        } else if self.typevar.is_same_typevar_as(db, other.right) {
+            Some(other.left)
+        } else {
+            None
+        };
+        if let Some(other_typevar) = other_typevar {
+            let derived = ConcreteEquivalenceBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                typevar: other_typevar,
+                bound: self.bound,
+            };
+            map.add_pair_implication(
+                Constraint::ConcreteEquivalence(self),
+                Constraint::TypeVarEquivalence(other),
+                Constraint::ConcreteEquivalence(derived),
+            );
+        }
+
+        // We can infer sequents from `T = α` and `S = U` if α _contains_ U.
+        Constraint::add_covariant_equivalence_weakened_sequent(
+            db,
+            env,
+            map,
+            self,
+            other.forwards(),
+        );
+        Constraint::add_covariant_equivalence_weakened_sequent(
+            db,
+            env,
+            map,
+            self,
+            other.backwards(),
+        );
+        Constraint::add_contravariant_equivalence_weakened_sequent(
+            db,
+            env,
+            map,
+            self,
+            other.forwards(),
+        );
+        Constraint::add_contravariant_equivalence_weakened_sequent(
+            db,
+            env,
+            map,
+            self,
+            other.backwards(),
+        );
+        Constraint::add_invariant_weakened_sequent(db, env, map, self, other.forwards());
+        Constraint::add_invariant_weakened_sequent(db, env, map, self, other.backwards());
     }
 }
 
@@ -1472,6 +2751,103 @@ impl<'db> TypeVarRangeBound<'db> {
             map.add_single_tautology(Constraint::TypeVarRange(self));
         }
     }
+
+    fn add_sequents_with_typevar_range(
+        self,
+        db: &'db dyn Db,
+        _env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarRangeBound<'db>,
+        _reversed: bool,
+    ) {
+        // `S ≤ T` and `T ≤ S` implies `S = T`
+        if self.left.is_same_typevar_as(db, other.right)
+            && self.right.is_same_typevar_as(db, other.left)
+        {
+            let derived = TypeVarEquivalenceBound::new(
+                ConstraintProvenance::derived(self.provenance, other.provenance),
+                self.left,
+                self.right,
+            );
+            map.add_pair_implication(
+                Constraint::TypeVarRange(self),
+                Constraint::TypeVarRange(other),
+                Constraint::TypeVarEquivalence(derived),
+            );
+            return;
+        }
+
+        // Given constraints `S ≤ T` and `T ≤ U`, `S ≤ U` must also hold.
+        let (left, right) = if self.right.is_same_typevar_as(db, other.left) {
+            (self.left, other.right)
+        } else if self.left.is_same_typevar_as(db, other.right) {
+            (other.left, self.right)
+        } else {
+            return;
+        };
+
+        let derived = TypeVarRangeBound {
+            provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+            left,
+            right,
+        };
+        map.add_pair_implication(
+            Constraint::TypeVarRange(self),
+            Constraint::TypeVarRange(other),
+            Constraint::TypeVarRange(derived),
+        );
+    }
+
+    fn add_sequents_with_typevar_equivalence(
+        self,
+        db: &'db dyn Db,
+        _env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarEquivalenceBound<'db>,
+        _reversed: bool,
+    ) {
+        // Given constraints `S ≤ T` and `T = U`, `S ≤ U` must also hold.
+        let replacement = if self.right.is_same_typevar_as(db, other.left) {
+            Some(other.right)
+        } else if self.right.is_same_typevar_as(db, other.right) {
+            Some(other.left)
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            let derived = TypeVarRangeBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                left: self.left,
+                right: replacement,
+            };
+            map.add_pair_implication(
+                Constraint::TypeVarRange(self),
+                Constraint::TypeVarEquivalence(other),
+                Constraint::TypeVarRange(derived),
+            );
+        }
+
+        // Given constraints `S ≤ T` and `R = S`, `R ≤ T` must also hold.
+        let replacement = if self.left.is_same_typevar_as(db, other.left) {
+            Some(other.right)
+        } else if self.left.is_same_typevar_as(db, other.right) {
+            Some(other.left)
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            let derived = TypeVarRangeBound {
+                provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                left: replacement,
+                right: self.right,
+            };
+            map.add_pair_implication(
+                Constraint::TypeVarRange(self),
+                Constraint::TypeVarEquivalence(other),
+                Constraint::TypeVarRange(derived),
+            );
+        }
+    }
 }
 
 impl<'db> TypeVarEquivalenceBound<'db> {
@@ -1479,6 +2855,57 @@ impl<'db> TypeVarEquivalenceBound<'db> {
         // `T = T` is always true
         if self.left.is_same_typevar_as(db, self.right) {
             map.add_single_tautology(Constraint::TypeVarEquivalence(self));
+        }
+    }
+
+    fn add_sequents_with_typevar_equivalence(
+        self,
+        db: &'db dyn Db,
+        _env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+        other: TypeVarEquivalenceBound<'db>,
+        _reversed: bool,
+    ) {
+        // Given constraints `S = T` and `T = U`, `S = U` must also hold.
+        let replacement = if self.right.is_same_typevar_as(db, other.left) {
+            Some(other.right)
+        } else if self.right.is_same_typevar_as(db, other.right) {
+            Some(other.left)
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            let derived = TypeVarEquivalenceBound::new(
+                ConstraintProvenance::derived(self.provenance, other.provenance),
+                self.left,
+                replacement,
+            );
+            map.add_pair_implication(
+                Constraint::TypeVarEquivalence(self),
+                Constraint::TypeVarEquivalence(other),
+                Constraint::TypeVarEquivalence(derived),
+            );
+        }
+
+        // Given constraints `S = T` and `R = S`, `R = T` must also hold.
+        let replacement = if self.left.is_same_typevar_as(db, other.left) {
+            Some(other.right)
+        } else if self.left.is_same_typevar_as(db, other.right) {
+            Some(other.left)
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            let derived = TypeVarEquivalenceBound::new(
+                ConstraintProvenance::derived(self.provenance, other.provenance),
+                replacement,
+                self.right,
+            );
+            map.add_pair_implication(
+                Constraint::TypeVarEquivalence(self),
+                Constraint::TypeVarEquivalence(other),
+                Constraint::TypeVarEquivalence(derived),
+            );
         }
     }
 }
@@ -1614,7 +3041,13 @@ mod tests {
         );
 
         for (left, right) in [(left, right), (right, left)] {
-            let sequents = SequentMap::for_constraint_pair(db, &env, &mut storage, left, right);
+            let sequents = SequentMap::<ConstraintId>::for_constraint_pair(
+                db,
+                &env,
+                &mut storage,
+                left,
+                right,
+            );
 
             assert!(
                 sequents
