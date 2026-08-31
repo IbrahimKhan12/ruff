@@ -5,6 +5,10 @@ use std::fmt::{Debug, Display};
 
 use smallvec::SmallVec;
 
+use crate::types::constraints::variables::{
+    ConcreteEquivalenceBound, ConcreteLowerBound, ConcreteUpperBound, Constraint,
+    TypeVarEquivalenceBound, TypeVarRangeBound,
+};
 use crate::types::constraints::{
     ALWAYS_FALSE, ALWAYS_TRUE, ConstraintBound, ConstraintBounds, ConstraintId,
     ConstraintSetBuilder, ConstraintSetStorage, IntersectionResult, Node,
@@ -15,7 +19,7 @@ use crate::types::visitor::{
     TypeCollector, TypeVisitor, any_over_type, walk_type_with_recursion_guard,
 };
 use crate::types::{BoundTypeVarInstance, Type, TypeVarVariance};
-use crate::{Db, ProgramEnvironment};
+use crate::{Db, Program, ProgramEnvironment};
 
 /// A collection of _sequents_ that describe how the constraints mentioned in a BDD relate to each
 /// other. These are used in several BDD operations that need to know about "derived facts" even if
@@ -36,7 +40,7 @@ use crate::{Db, ProgramEnvironment};
 /// new constraint, and then merges those cached sequents into its own sequent map. (That means we
 /// also share the work of calculating the sequent map across `PathAssignments` for _different_
 /// constraint sets.)
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) struct SequentMap<C> {
     pub(super) sequents: Vec<Sequent<C>>,
 }
@@ -51,7 +55,7 @@ impl<C> Default for SequentMap<C> {
 
 /// Describes one rule for deriving new implicit constraints from existing constraints in a BDD
 /// path.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(super) enum Sequent<C> {
     /// Sequent of the form `¬C → false`
     ///
@@ -114,7 +118,7 @@ impl SequentMap<ConstraintId> {
                 constraint = %constraint.display(db, env, storage),
                 "add sequents for constraint",
             );
-            let mut map = SequentMap::default();
+            let mut map = Self::default();
             map.add_sequents_for_single(db, env, storage, constraint);
             storage.single_sequent_cache.insert(key, map);
         }
@@ -142,7 +146,7 @@ impl SequentMap<ConstraintId> {
                 right = %right.display(db, env, storage),
                 "add sequents for constraint pair",
             );
-            let mut map = SequentMap::default();
+            let mut map = Self::default();
             map.add_sequents_for_pair(db, env, storage, left, right);
             storage.pair_sequent_cache.insert(key, map);
         }
@@ -1355,6 +1359,127 @@ impl SequentMap<ConstraintId> {
             }
             Ok(())
         })
+    }
+}
+
+#[expect(dead_code)]
+impl<'db> SequentMap<Constraint<'db>> {
+    fn add_single_tautology(&mut self, ante: Constraint<'db>) {
+        self.sequents.push(Sequent::SingleTautology { ante });
+    }
+
+    fn add_single_implication(&mut self, ante: Constraint<'db>, post: Constraint<'db>) {
+        self.sequents
+            .push(Sequent::SingleImplication { ante, post });
+    }
+
+    /// Returns a sequent map containing the sequents that we can infer from a single constraint in
+    /// isolation. This method is cached so that we only perform this work once per
+    /// constraint.
+    pub(super) fn for_constraint(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        constraint: Constraint<'db>,
+    ) -> &'db Self {
+        #[salsa::tracked(returns(ref))]
+        fn for_constraint_inner<'db>(
+            db: &'db dyn Db,
+            program: Program<'db>,
+            constraint: Constraint<'db>,
+        ) -> SequentMap<Constraint<'db>> {
+            let env = &ProgramEnvironment::from_program(program);
+            tracing::trace!(
+                target: "ty_python_semantic::types::constraints::SequentMap",
+                constraint = %constraint.display(db, env, Some(true)),
+                "add sequents for constraint",
+            );
+            let mut map = SequentMap::<Constraint<'db>>::default();
+            constraint.add_sequents(db, &mut map);
+            map
+        }
+
+        for_constraint_inner(db, env.program(db), constraint)
+    }
+}
+
+impl<'db> Constraint<'db> {
+    fn add_sequents(self, db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+        match self {
+            Constraint::ConcreteLower(this) => this.add_sequents(db, map),
+            Constraint::ConcreteUpper(this) => this.add_sequents(db, map),
+            Constraint::ConcreteEquivalence(this) => this.add_sequents(db, map),
+            Constraint::TypeVarRange(this) => this.add_sequents(db, map),
+            Constraint::TypeVarEquivalence(this) => this.add_sequents(db, map),
+        }
+    }
+}
+
+impl<'db> ConcreteLowerBound<'db> {
+    fn add_sequents(self, _db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+        // `Never ≤ T` is always true
+        if self.bound.is_never() {
+            map.add_single_tautology(Constraint::ConcreteLower(self));
+        }
+
+        // `object ≤ T` implies `T = object`
+        if self.bound.is_object() {
+            let derived = ConcreteEquivalenceBound {
+                provenance: self.provenance,
+                typevar: self.typevar,
+                bound: self.bound,
+            };
+            map.add_single_implication(
+                Constraint::ConcreteLower(self),
+                Constraint::ConcreteEquivalence(derived),
+            );
+        }
+    }
+}
+
+impl<'db> ConcreteUpperBound<'db> {
+    fn add_sequents(self, _db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+        // `T ≤ object` is always true
+        if self.bound.is_object() {
+            map.add_single_tautology(Constraint::ConcreteUpper(self));
+        }
+
+        // `T ≤ Never` implies `T = Never`
+        if self.bound.is_never() {
+            let derived = ConcreteEquivalenceBound {
+                provenance: self.provenance,
+                typevar: self.typevar,
+                bound: self.bound,
+            };
+            map.add_single_implication(
+                Constraint::ConcreteUpper(self),
+                Constraint::ConcreteEquivalence(derived),
+            );
+        }
+    }
+}
+
+impl<'db> ConcreteEquivalenceBound<'db> {
+    #[expect(clippy::unused_self)]
+    fn add_sequents(self, _db: &'db dyn Db, _map: &mut SequentMap<Constraint<'db>>) {
+        // We cannot infer any sequents from `T = α` on its own.
+    }
+}
+
+impl<'db> TypeVarRangeBound<'db> {
+    fn add_sequents(self, db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+        // `T ≤ T` is always true
+        if self.left.is_same_typevar_as(db, self.right) {
+            map.add_single_tautology(Constraint::TypeVarRange(self));
+        }
+    }
+}
+
+impl<'db> TypeVarEquivalenceBound<'db> {
+    fn add_sequents(self, db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+        // `T = T` is always true
+        if self.left.is_same_typevar_as(db, self.right) {
+            map.add_single_tautology(Constraint::TypeVarEquivalence(self));
+        }
     }
 }
 
