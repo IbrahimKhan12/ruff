@@ -126,6 +126,9 @@ mod variables;
 use paths::PathAssignments;
 use sequents::SequentMap;
 use solutions::SolutionWalker;
+use variables::{
+    ConcreteLowerBound, ConcreteUpperBound, Constraint, ConstraintProvenance, TypeVarRangeBound,
+};
 
 /// An extension trait for building constraint sets from [`Option`] values.
 pub(crate) trait OptionConstraintsExtension<T> {
@@ -1873,6 +1876,49 @@ pub(crate) struct OldConstraint<'db> {
     bounds: ConstraintBounds<'db>,
 }
 
+impl<'db> OldConstraint<'db> {
+    #[expect(unused)]
+    fn into_new(self) -> SmallVec<[Constraint<'db>; 2]> {
+        let mut result = SmallVec::default();
+
+        if let Some(lower) = self.bounds.lower {
+            let (provenance, bound) = lower.into_parts();
+            if let Some(bound) = bound.as_typevar() {
+                result.push(Constraint::TypeVarRange(TypeVarRangeBound {
+                    provenance,
+                    left: bound,
+                    right: self.typevar,
+                }));
+            } else {
+                result.push(Constraint::ConcreteLower(ConcreteLowerBound {
+                    provenance,
+                    typevar: self.typevar,
+                    bound,
+                }));
+            }
+        }
+
+        if let Some(upper) = self.bounds.upper {
+            let (provenance, bound) = upper.into_parts();
+            if let Some(bound) = bound.as_typevar() {
+                result.push(Constraint::TypeVarRange(TypeVarRangeBound {
+                    provenance,
+                    left: self.typevar,
+                    right: bound,
+                }));
+            } else {
+                result.push(Constraint::ConcreteUpper(ConcreteUpperBound {
+                    provenance,
+                    typevar: self.typevar,
+                    bound,
+                }));
+            }
+        }
+
+        result
+    }
+}
+
 /// The lower or upper bound of a constraint, along with its _provenance_
 ///
 /// Most bounds come from specific relationships found at the call site — for instance, the
@@ -1896,6 +1942,13 @@ pub(crate) enum ConstraintBound<'db> {
 }
 
 impl<'db> ConstraintBound<'db> {
+    fn into_parts(self) -> (ConstraintProvenance, Type<'db>) {
+        match self {
+            Self::Validity(ty) => (ConstraintProvenance::Validity, ty),
+            Self::Evidence(ty) => (ConstraintProvenance::Evidence, ty),
+        }
+    }
+
     const fn missing_lower() -> Self {
         Self::Validity(Type::Never)
     }
