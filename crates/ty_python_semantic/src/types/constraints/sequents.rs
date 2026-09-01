@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::fmt::{Debug, Display};
 
-use smallvec::SmallVec;
+use smallvec::{SmallVec, smallvec};
 
 use crate::types::constraints::variables::{
     ConcreteEquivalenceBound, ConcreteLowerBound, ConcreteUpperBound, Constraint,
@@ -13,7 +13,8 @@ use crate::types::constraints::variables::{
 };
 use crate::types::constraints::{
     ALWAYS_FALSE, ALWAYS_TRUE, ConstraintBound, ConstraintBounds, ConstraintId,
-    ConstraintSetBuilder, ConstraintSetStorage, IntersectionResult, Node, OwnedConstraintSet,
+    ConstraintSetBuilder, ConstraintSetStorage, InterimConstraint, IntersectionResult, Node,
+    OldConstraint, OwnedConstraintSet,
 };
 use crate::types::typevar::TypeVarSet;
 use crate::types::variance::VarianceInferable;
@@ -1715,37 +1716,53 @@ impl<'db> Constraint<'db> {
                 return;
             }
 
+            // XXX: Remove this once we don't have to deal with old constraints.
+            let previous_sequent_count = map.sequents.len();
             loop {
                 match node.node() {
                     Node::AlwaysTrue | Node::AlwaysFalse => break,
                     Node::Interior(interior) => {
                         let interior = storage.interior_node_data(interior.node());
-                        // XXX
-                        let derived = upper_constraint;
-                        /*
                         let derived = storage.constraint_data(interior.constraint);
-                        let derived =
-                            ConstraintId::new_with_bounds(
-                                db,
-                                env,
-                                storage,
-                                derived.typevar,
-                                derived.bounds.lower.map(|bound| {
-                                    bound.with_source_provenance(constraint_data.bounds)
-                                }),
-                                derived.bounds.upper.map(|bound| {
-                                    bound.with_source_provenance(constraint_data.bounds)
-                                }),
-                            );
-                        */
+                        let derived = match derived {
+                            InterimConstraint::Old(derived) => {
+                                let lower = derived
+                                    .bounds
+                                    .lower
+                                    .map(|bound| bound.with_source_provenance(derived.bounds));
+                                let upper = derived
+                                    .bounds
+                                    .upper
+                                    .map(|bound| bound.with_source_provenance(derived.bounds));
+                                let old = InterimConstraint::Old(OldConstraint {
+                                    typevar: derived.typevar,
+                                    bounds: ConstraintBounds::new(lower, upper),
+                                });
+                                old.into_new()
+                            }
+                            InterimConstraint::New(derived) => smallvec![derived],
+                        };
                         if interior.if_true != ALWAYS_FALSE {
-                            map.add_pair_implication(lower_constraint, upper_constraint, derived);
+                            for derived in derived {
+                                map.add_pair_implication(
+                                    lower_constraint,
+                                    upper_constraint,
+                                    derived,
+                                );
+                            }
                             node = interior.if_true;
                         } else {
+                            let [derived] = derived.as_slice() else {
+                                // Back out any incomplete sequents we had added before discovering
+                                // this disjunction.
+                                // XXX: Remove this once we don't have to deal with old constraints.
+                                map.sequents.truncate(previous_sequent_count);
+                                return;
+                            };
                             map.add_triple_impossibility(
                                 lower_constraint,
                                 upper_constraint,
-                                derived,
+                                *derived,
                             );
                             node = interior.if_false;
                         }
