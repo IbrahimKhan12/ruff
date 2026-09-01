@@ -9281,8 +9281,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // Check for unsound calls to abstract classmethods/staticmethods on class objects
         match callable_type {
-            Type::BoundMethod(bound_method) => {
-                let function = bound_method.function(self.db());
+            Type::BoundMethod(bound_method) if let Some(function) = bound_method.function(db) => {
                 if let Some(class) = bound_method.self_instance(self.db()).to_class_type(db) {
                     if function.is_classmethod(self.db())
                         && function.as_abstract_method(self.db(), class).is_some()
@@ -10022,7 +10021,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Next handle functions
         let function = match ty {
             Type::FunctionLiteral(function) => function,
-            Type::BoundMethod(bound) => bound.function(self.db()),
+            Type::BoundMethod(bound) if let Some(function) = bound.function(self.db()) => function,
             _ => return,
         };
 
@@ -10058,7 +10057,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         for callables in bindings.iter_union_elements() {
             if callables.clone().all(|callable| {
                 let ty = match callable.callable_type {
-                    Type::BoundMethod(bound) => Type::FunctionLiteral(bound.function(db)),
+                    Type::BoundMethod(bound) => bound.func(db),
                     ty => ty,
                 };
                 ty.is_deprecated(db)
