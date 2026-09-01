@@ -1741,6 +1741,42 @@ impl<'db> Constraint<'db> {
         });
     }
 
+    /// Substitutes `replacement_bound` for `replacement_typevar` as long as it does not
+    /// recursively deepen the bound on `needle_typevar`.
+    ///
+    /// A replacement containing `replacement_typevar`, such as substituting `G[U]` for `U`, can be
+    /// fed back into the same substitution to produce `G[G[U]]`. A replacement containing
+    /// `needle_typevar` can produce the same cycle across the two constraints. Repeatedly
+    /// following either pattern does not reach a fixed point, so we skip both.
+    fn substitute_if_not_recursive(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        needle_typevar: BoundTypeVarInstance<'db>,
+        needle_bound: Type<'db>,
+        replacement_typevar: BoundTypeVarInstance<'db>,
+        replacement_bound: Type<'db>,
+    ) -> Option<Type<'db>> {
+        if let Type::TypeVar(replacement) = replacement_bound
+            && (replacement.is_same_typevar_as(db, needle_typevar)
+                || replacement.is_same_typevar_as(db, replacement_typevar))
+        {
+            return None;
+        }
+
+        if replacement_bound.variance_of(db, env, needle_typevar.identity(db))
+            != TypeVarVariance::Bivariant
+        {
+            return None;
+        }
+        if replacement_bound.variance_of(db, env, replacement_typevar.identity(db))
+            != TypeVarVariance::Bivariant
+        {
+            return None;
+        }
+
+        Some(needle_bound.substitute_one_typevar(db, env, replacement_typevar, replacement_bound))
+    }
+
     fn add_covariant_lower_tightened_sequent(
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
@@ -1760,9 +1796,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement = left
-            .bound
-            .substitute_one_typevar(db, env, right.typevar, right.bound);
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.typevar,
+            right.bound,
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance),
             replacement,
@@ -1789,9 +1832,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement = left
-            .bound
-            .substitute_one_typevar(db, env, right.typevar, right.bound);
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.typevar,
+            right.bound,
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance),
             replacement,
@@ -1813,9 +1863,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement = left
-            .bound
-            .substitute_one_typevar(db, env, right.typevar, right.bound);
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.typevar,
+            right.bound,
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance),
             replacement,
@@ -1841,11 +1898,15 @@ impl<'db> Constraint<'db> {
         //   (Contra[U] ≤ T) ∧ (U ≤ β) ⇒ (Contra[β] ≤ T)
         if lower.bound.variance_of(db, env, upper.typevar.identity(db))
             == TypeVarVariance::Contravariant
+            && let Some(replacement) = Constraint::substitute_if_not_recursive(
+                db,
+                env,
+                lower.typevar,
+                lower.bound,
+                upper.typevar,
+                upper.bound,
+            )
         {
-            let replacement =
-                lower
-                    .bound
-                    .substitute_one_typevar(db, env, upper.typevar, upper.bound);
             let derived = lower.map(provenance, replacement);
             map.add_pair_implication(lower_constraint, upper_constraint, derived.constraint());
         }
@@ -1855,11 +1916,15 @@ impl<'db> Constraint<'db> {
         //   (α ≤ T) ∧ (U ≤ Contra[T]) ⇒ (U ≤ Contra[α])
         if upper.bound.variance_of(db, env, lower.typevar.identity(db))
             == TypeVarVariance::Contravariant
+            && let Some(replacement) = Constraint::substitute_if_not_recursive(
+                db,
+                env,
+                upper.typevar,
+                upper.bound,
+                lower.typevar,
+                lower.bound,
+            )
         {
-            let replacement =
-                upper
-                    .bound
-                    .substitute_one_typevar(db, env, lower.typevar, lower.bound);
             let derived = upper.map(provenance, replacement);
             map.add_pair_implication(lower_constraint, upper_constraint, derived.constraint());
         }
@@ -1883,9 +1948,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement = left
-            .bound()
-            .substitute_one_typevar(db, env, right.typevar, right.bound);
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar(),
+            left.bound(),
+            right.typevar,
+            right.bound,
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance(), right.provenance),
             replacement,
@@ -1911,9 +1983,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement =
-            left.bound
-                .substitute_one_typevar(db, env, right.right(), Type::TypeVar(right.left()));
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.right(),
+            Type::TypeVar(right.left()),
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance()),
             replacement,
@@ -1939,9 +2018,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement =
-            left.bound
-                .substitute_one_typevar(db, env, right.left(), Type::TypeVar(right.right()));
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.left(),
+            Type::TypeVar(right.right()),
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance()),
             replacement,
@@ -1964,9 +2050,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement =
-            left.bound
-                .substitute_one_typevar(db, env, right.left(), Type::TypeVar(right.right()));
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.left(),
+            Type::TypeVar(right.right()),
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance()),
             replacement,
@@ -1993,9 +2086,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement =
-            left.bound
-                .substitute_one_typevar(db, env, right.left(), Type::TypeVar(right.right()));
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.left(),
+            Type::TypeVar(right.right()),
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance()),
             replacement,
@@ -2022,9 +2122,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement =
-            left.bound
-                .substitute_one_typevar(db, env, right.right(), Type::TypeVar(right.left()));
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.right(),
+            Type::TypeVar(right.left()),
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance()),
             replacement,
@@ -2048,9 +2155,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement =
-            left.bound
-                .substitute_one_typevar(db, env, right.left(), Type::TypeVar(right.right()));
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
+            db,
+            env,
+            left.typevar,
+            left.bound,
+            right.left(),
+            Type::TypeVar(right.right()),
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance, right.provenance()),
             replacement,
@@ -2074,12 +2188,16 @@ impl<'db> Constraint<'db> {
         {
             return;
         }
-        let replacement = left.bound().substitute_one_typevar(
+        let Some(replacement) = Constraint::substitute_if_not_recursive(
             db,
             env,
+            left.typevar(),
+            left.bound(),
             right.left(),
             Type::TypeVar(right.right()),
-        );
+        ) else {
+            return;
+        };
         let derived = left.map(
             ConstraintProvenance::derived(left.provenance(), right.provenance()),
             replacement,
@@ -2674,7 +2792,7 @@ impl<'db> ConcreteEquivalenceBound<'db> {
             );
         }
 
-        // We can infer sequents from `T = α` and `S ≤ U` if α _contains_ U.
+        // We can infer sequents from `T = α` and `S ≤ U` if α _contains_ S or U.
         Constraint::add_covariant_lower_weakened_sequent(db, env, map, self, other);
         Constraint::add_covariant_upper_weakened_sequent(db, env, map, self, other);
         Constraint::add_contravariant_lower_weakened_sequent(db, env, map, self, other);
