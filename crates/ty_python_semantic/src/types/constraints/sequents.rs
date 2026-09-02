@@ -1436,7 +1436,7 @@ impl<'db> SequentMap<Constraint<'db>> {
                 "add sequents for constraint",
             );
             let mut map = SequentMap::<Constraint<'db>>::default();
-            constraint.add_sequents(db, &mut map);
+            constraint.add_sequents(db, env, &mut map);
             map
         }
 
@@ -1483,13 +1483,18 @@ impl<'db> SequentMap<Constraint<'db>> {
 }
 
 impl<'db> Constraint<'db> {
-    fn add_sequents(self, db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+    fn add_sequents(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+    ) {
         match self {
-            Constraint::ConcreteLower(this) => this.add_sequents(db, map),
-            Constraint::ConcreteUpper(this) => this.add_sequents(db, map),
-            Constraint::ConcreteEquivalence(this) => this.add_sequents(db, map),
-            Constraint::TypeVarRange(this) => this.add_sequents(db, map),
-            Constraint::TypeVarEquivalence(this) => this.add_sequents(db, map),
+            Constraint::ConcreteLower(this) => this.add_sequents(db, env, map),
+            Constraint::ConcreteUpper(this) => this.add_sequents(db, env, map),
+            Constraint::ConcreteEquivalence(this) => this.add_sequents(db, env, map),
+            Constraint::TypeVarRange(this) => this.add_sequents(db, env, map),
+            Constraint::TypeVarEquivalence(this) => this.add_sequents(db, env, map),
         }
     }
 
@@ -2266,7 +2271,12 @@ fn possibly_reversed_union<'db>(
 }
 
 impl<'db> ConcreteLowerBound<'db> {
-    fn add_sequents(self, _db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+    fn add_sequents(
+        self,
+        _db: &'db dyn Db,
+        _env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+    ) {
         // `Never ≤ T` is always true
         if self.bound.is_never() {
             map.add_single_tautology(Constraint::ConcreteLower(self));
@@ -2403,8 +2413,8 @@ impl<'db> ConcreteLowerBound<'db> {
         // `(α ≤ T) ∧ (T ≤ β)` simplifies to `T = α` when `α = β`. (We don't need to add the
         // projection implication `(T = α) ⇒ (α ≤ T)`, since anything we can derive from `α ≤ T` we
         // can also derive from `T = α`.)
-        let lower = self.bound;
-        let upper = other.bound;
+        let lower = self.bound.bottom_materialization(db, env);
+        let upper = other.bound.top_materialization(db, env);
         if lower.is_constraint_set_equivalent_to(db, env, upper) {
             let simplified = ConcreteEquivalenceBound {
                 provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
@@ -2419,17 +2429,21 @@ impl<'db> ConcreteLowerBound<'db> {
             return;
         }
 
-        // Given constraints `α ≤ T` and `T ≤ β`, `α ≤ β` must also hold. If those bounds contain
-        // other typevars, we can infer additional constraints.
-        Constraint::add_sequents_for_range(
-            db,
-            env,
-            map,
-            Constraint::ConcreteLower(self),
-            self.bound,
-            Constraint::ConcreteUpper(other),
-            other.bound,
-        );
+        // Gradual assignability is not transitive, so only fully static bounds can contribute
+        // additional range sequents.
+        if self.bound.is_static_sequent_eligible(db, env)
+            && other.bound.is_static_sequent_eligible(db, env)
+        {
+            Constraint::add_sequents_for_range(
+                db,
+                env,
+                map,
+                Constraint::ConcreteLower(self),
+                lower,
+                Constraint::ConcreteUpper(other),
+                upper,
+            );
+        }
     }
 
     fn add_sequents_with_concrete_equivalence(
@@ -2540,7 +2554,12 @@ impl<'db> ConcreteLowerBound<'db> {
 }
 
 impl<'db> ConcreteUpperBound<'db> {
-    fn add_sequents(self, _db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+    fn add_sequents(
+        self,
+        _db: &'db dyn Db,
+        _env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+    ) {
         // `T ≤ object` is always true
         if self.bound.is_object() {
             map.add_single_tautology(Constraint::ConcreteUpper(self));
@@ -2748,7 +2767,12 @@ impl<'db> ConcreteUpperBound<'db> {
 
 impl<'db> ConcreteEquivalenceBound<'db> {
     #[expect(clippy::unused_self)]
-    fn add_sequents(self, _db: &'db dyn Db, _map: &mut SequentMap<Constraint<'db>>) {
+    fn add_sequents(
+        self,
+        _db: &'db dyn Db,
+        _env: &ProgramEnvironment<'db>,
+        _map: &mut SequentMap<Constraint<'db>>,
+    ) {
         // We cannot infer any sequents from `T = α` on its own.
     }
 
@@ -2918,7 +2942,12 @@ impl<'db> ConcreteEquivalenceBound<'db> {
 }
 
 impl<'db> TypeVarRangeBound<'db> {
-    fn add_sequents(self, db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+    fn add_sequents(
+        self,
+        db: &'db dyn Db,
+        _env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+    ) {
         // `T ≤ T` is always true
         if self.left.is_same_typevar_as(db, self.right) {
             map.add_single_tautology(Constraint::TypeVarRange(self));
@@ -3024,7 +3053,12 @@ impl<'db> TypeVarRangeBound<'db> {
 }
 
 impl<'db> TypeVarEquivalenceBound<'db> {
-    fn add_sequents(self, db: &'db dyn Db, map: &mut SequentMap<Constraint<'db>>) {
+    fn add_sequents(
+        self,
+        db: &'db dyn Db,
+        _env: &ProgramEnvironment<'db>,
+        map: &mut SequentMap<Constraint<'db>>,
+    ) {
         // `T = T` is always true
         if self.left.is_same_typevar_as(db, self.right) {
             map.add_single_tautology(Constraint::TypeVarEquivalence(self));
