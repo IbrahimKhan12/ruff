@@ -7,8 +7,8 @@ use itertools::Either;
 use salsa::plumbing::AsId;
 
 use crate::types::constraints::{
-    ALWAYS_TRUE, ConstraintSetBuilder, ConstraintSetStorage, InterimConstraint, Node, NodeId,
-    SourceOrderId, max_constructor_and_typevar_depth,
+    ALWAYS_FALSE, ALWAYS_TRUE, ConstraintSetBuilder, ConstraintSetStorage, InterimConstraint, Node,
+    NodeId, SourceOrderId, max_constructor_and_typevar_depth,
 };
 use crate::types::typevar::TypeVarSet;
 use crate::types::{ApplyTypeMappingVisitor, BoundTypeVarInstance, Type, TypeContext, TypeMapping};
@@ -68,6 +68,8 @@ impl ConstraintProvenance {
     }
 }
 
+pub(super) struct UnsatisfiableBound;
+
 /// One condition that can be checked by an interior node in a constraint set BDD
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(crate) enum Constraint<'db> {
@@ -93,10 +95,13 @@ impl<'db> Constraint<'db> {
         db: &'db dyn Db,
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
-        constraints: impl IntoIterator<Item = Self>,
+        constraints: impl IntoIterator<Item = Result<Self, UnsatisfiableBound>>,
     ) -> (NodeId, Option<SourceOrderId>) {
         let (mut node, mut source_order) = (ALWAYS_TRUE, None);
         for constraint in constraints {
+            let Ok(constraint) = constraint else {
+                return (ALWAYS_FALSE, None);
+            };
             let (constraint_node, constraint_source_order) = constraint.new_node(db, env, storage);
             node = node.and(storage, constraint_node);
             source_order = storage.ordered_source_order(source_order, constraint_source_order);
@@ -112,21 +117,47 @@ impl<'db> Constraint<'db> {
         provenance: ConstraintProvenance,
         typevar: BoundTypeVarInstance<'db>,
         bound: Type<'db>,
-    ) -> impl Iterator<Item = Self> {
+    ) -> impl Iterator<Item = Result<Self, UnsatisfiableBound>> {
         let choose_lower_bound = move |bound: Type<'db>| match bound {
             // Two identical typevars must always solve to the same type, so it is not useful to
             // have a lower bound that is the typevar being constrained.
             Type::TypeVar(lower) if typevar.is_same_typevar_as(db, lower) => None,
-            Type::TypeVar(lower) => Some(Constraint::TypeVarRange(TypeVarRangeBound {
+
+            // The same applies for a lower bound that's an intersection containing the typevar
+            // being constrained.
+            Type::Intersection(intersection)
+                if intersection.positive(db).iter().any(|element| {
+                    element.as_typevar().is_some_and(|element_bound_typevar| {
+                        typevar.is_same_typevar_as(db, element_bound_typevar)
+                    })
+                }) =>
+            {
+                None
+            }
+
+            // And if we find the _negation_ of the typevar being constrained, the overall result
+            // is unsatisfiable.
+            Type::Intersection(intersection)
+                if intersection.negative(db).iter().any(|element| {
+                    element.as_typevar().is_some_and(|element_bound_typevar| {
+                        typevar.is_same_typevar_as(db, element_bound_typevar)
+                    })
+                }) =>
+            {
+                Some(Err(UnsatisfiableBound))
+            }
+
+            // Otherwise we construct a concrete or typevar constraint, as appropriate.
+            Type::TypeVar(lower) => Some(Ok(Constraint::TypeVarRange(TypeVarRangeBound {
                 provenance,
                 left: lower,
                 right: typevar,
-            })),
-            _ => Some(Constraint::ConcreteLower(ConcreteLowerBound {
+            }))),
+            _ => Some(Ok(Constraint::ConcreteLower(ConcreteLowerBound {
                 provenance,
                 typevar,
                 bound,
-            })),
+            }))),
         };
 
         // It's not useful for a lower bound to be a union type. Because the following equivalence
@@ -140,7 +171,8 @@ impl<'db> Constraint<'db> {
                 bound
                     .elements(db)
                     .iter()
-                    .filter_map(move |&element| choose_lower_bound(element)),
+                    .copied()
+                    .filter_map(choose_lower_bound),
             ),
             _ => Either::Right(choose_lower_bound(bound).into_iter()),
         }
@@ -157,21 +189,35 @@ impl<'db> Constraint<'db> {
         provenance: ConstraintProvenance,
         typevar: BoundTypeVarInstance<'db>,
         bound: Type<'db>,
-    ) -> impl Iterator<Item = Self> {
+    ) -> impl Iterator<Item = Result<Self, UnsatisfiableBound>> {
         let choose_upper_bound = move |bound: Type<'db>| match bound {
             // Two identical typevars must always solve to the same type, so it is not useful to
             // have an upper bound that is the typevar being constrained.
             Type::TypeVar(upper) if typevar.is_same_typevar_as(db, upper) => None,
-            Type::TypeVar(upper) => Some(Constraint::TypeVarRange(TypeVarRangeBound {
+
+            // The same applies for an upper bound that's a union containing the typevar
+            // being constrained.
+            Type::Union(union)
+                if union.elements(db).iter().any(|element| {
+                    element.as_typevar().is_some_and(|element_bound_typevar| {
+                        typevar.is_same_typevar_as(db, element_bound_typevar)
+                    })
+                }) =>
+            {
+                None
+            }
+
+            // Otherwise we construct a concrete or typevar constraint, as appropriate.
+            Type::TypeVar(upper) => Some(Ok(Constraint::TypeVarRange(TypeVarRangeBound {
                 provenance,
                 left: typevar,
                 right: upper,
-            })),
-            _ => Some(Constraint::ConcreteUpper(ConcreteUpperBound {
+            }))),
+            _ => Some(Ok(Constraint::ConcreteUpper(ConcreteUpperBound {
                 provenance,
                 typevar,
                 bound,
-            })),
+            }))),
         };
 
         // It's not useful for an upper bound to be an intersection type. Because the following
@@ -201,19 +247,59 @@ impl<'db> Constraint<'db> {
         provenance: ConstraintProvenance,
         typevar: BoundTypeVarInstance<'db>,
         bound: Type<'db>,
-    ) -> Option<Self> {
+    ) -> Option<Result<Self, UnsatisfiableBound>> {
         match bound {
             // Two identical typevars must always solve to the same type, so it is not useful to
             // have an equivalence bound that is the typevar being constrained.
             Type::TypeVar(bound) if typevar.is_same_typevar_as(db, bound) => None,
-            Type::TypeVar(bound) => Some(Constraint::TypeVarEquivalence(
+
+            // The same applies for an equivalence bound that's an intersection containing the
+            // typevar being constrained.
+            Type::Intersection(intersection)
+                if intersection.positive(db).iter().any(|element| {
+                    element.as_typevar().is_some_and(|element_bound_typevar| {
+                        typevar.is_same_typevar_as(db, element_bound_typevar)
+                    })
+                }) =>
+            {
+                None
+            }
+
+            // And if we find the _negation_ of the typevar being constrained, the overall result
+            // is unsatisfiable.
+            Type::Intersection(intersection)
+                if intersection.negative(db).iter().any(|element| {
+                    element.as_typevar().is_some_and(|element_bound_typevar| {
+                        typevar.is_same_typevar_as(db, element_bound_typevar)
+                    })
+                }) =>
+            {
+                Some(Err(UnsatisfiableBound))
+            }
+
+            // The same applies for an equivalence bound that's a union containing the typevar
+            // being constrained.
+            Type::Union(union)
+                if union.elements(db).iter().any(|element| {
+                    element.as_typevar().is_some_and(|element_bound_typevar| {
+                        typevar.is_same_typevar_as(db, element_bound_typevar)
+                    })
+                }) =>
+            {
+                None
+            }
+
+            // Otherwise we construct a concrete or typevar constraint, as appropriate.
+            Type::TypeVar(bound) => Some(Ok(Constraint::TypeVarEquivalence(
                 TypeVarEquivalenceBound::new(provenance, typevar, bound),
-            )),
-            _ => Some(Constraint::ConcreteEquivalence(ConcreteEquivalenceBound {
-                provenance,
-                typevar,
-                bound,
-            })),
+            ))),
+            _ => Some(Ok(Constraint::ConcreteEquivalence(
+                ConcreteEquivalenceBound {
+                    provenance,
+                    typevar,
+                    bound,
+                },
+            ))),
         }
     }
 

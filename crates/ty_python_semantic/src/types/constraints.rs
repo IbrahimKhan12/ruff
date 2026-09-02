@@ -2014,6 +2014,7 @@ impl<'db> OldConstraint<'db> {
                     lower,
                 )
                 .into_iter()
+                .flatten()
                 .collect();
             }
         }
