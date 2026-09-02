@@ -13,9 +13,8 @@ use crate::types::class::ClassType;
 use crate::types::class_base::ClassBase;
 use crate::types::constraints::projection::{ProjectionError, SolutionBudget, SolutionProjection};
 use crate::types::constraints::{
-    ConstraintBound, ConstraintBounds, ConstraintSet, ConstraintSetBuilder,
-    IteratorConstraintsExtension, PathBound, PathBoundSolution, PathBounds, SolutionPaths,
-    Solutions, TypeVarSolution,
+    ConstraintSet, ConstraintSetBuilder, IteratorConstraintsExtension, PathBound,
+    PathBoundSolution, PathBounds, SolutionPaths, Solutions, TypeVarSolution,
 };
 use crate::types::infer::original_class_type;
 use crate::types::relation::{
@@ -3265,22 +3264,13 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
     fn intersect_pending_typevar_constraint(
         &mut self,
         bound_typevar: BoundTypeVarInstance<'db>,
-        bounds: ConstraintBounds<'db>,
+        constraint: ConstraintSet<'db, 'c>,
     ) {
         let db = self.db;
         let identity = bound_typevar.identity(db);
         if bound_typevar.is_paramspec(db) && !self.paramspec_seen.insert(identity) {
             return;
         }
-
-        let constraint = ConstraintSet::constrain_typevar_with_bounds(
-            db,
-            self.env,
-            self.constraints,
-            bound_typevar,
-            bounds.lower,
-            bounds.upper,
-        );
         self.pending.intersect(db, self.constraints, constraint);
     }
 
@@ -3318,17 +3308,31 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         ty: Type<'db>,
         variance: TypeVarVariance,
     ) {
-        let bounds = match variance {
-            TypeVarVariance::Covariant => {
-                ConstraintBounds::new(Some(ConstraintBound::Evidence(ty)), None)
-            }
-            TypeVarVariance::Contravariant => {
-                ConstraintBounds::new(None, Some(ConstraintBound::Evidence(ty)))
-            }
-            TypeVarVariance::Invariant => ConstraintBounds::exact(ty),
+        let constraint = match variance {
+            TypeVarVariance::Covariant => ConstraintSet::constrain_typevar_lower_bound(
+                self.db,
+                self.env,
+                self.constraints,
+                bound_typevar,
+                ty,
+            ),
+            TypeVarVariance::Contravariant => ConstraintSet::constrain_typevar_upper_bound(
+                self.db,
+                self.env,
+                self.constraints,
+                bound_typevar,
+                ty,
+            ),
+            TypeVarVariance::Invariant => ConstraintSet::constrain_typevar_equivalence_bound(
+                self.db,
+                self.env,
+                self.constraints,
+                bound_typevar,
+                ty,
+            ),
             TypeVarVariance::Bivariant => return,
         };
-        self.intersect_pending_typevar_constraint(bound_typevar, bounds);
+        self.intersect_pending_typevar_constraint(bound_typevar, constraint);
     }
 
     /// Solves one relation without recording it or changing the legacy type mappings.

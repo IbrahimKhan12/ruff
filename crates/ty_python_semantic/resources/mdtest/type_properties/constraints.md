@@ -1134,6 +1134,6 @@ def _[T]() -> None:
     reveal_type(ConstraintSet.range(Sub, T, Super))
     # We are not asserting anything specific about what's displayed here, just that it's different
     # from above. If our constraint set rendering changes, update this accordingly.
-    # revealed: ConstraintSet[(Sub ≤ T@_ ≤ Super)]
+    # revealed: ConstraintSet[((Sub ≤ T@_) ∧ (T@_ ≤ Super))]
     reveal_type(ConstraintSet.range(Sub, T, Super).with_detailed_display())
 ```
