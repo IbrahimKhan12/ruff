@@ -217,6 +217,16 @@ impl<'db> Constraint<'db> {
         }
     }
 
+    pub(super) fn is_reflexive_typevar_relation(self, db: &'db dyn Db) -> bool {
+        match self {
+            Constraint::TypeVarRange(this) => this.left.is_same_typevar_as(db, this.right),
+            Constraint::TypeVarEquivalence(this) => this.left.is_same_typevar_as(db, this.right),
+            Constraint::ConcreteLower(_)
+            | Constraint::ConcreteUpper(_)
+            | Constraint::ConcreteEquivalence(_) => false,
+        }
+    }
+
     pub(super) fn provides_lower(self) -> bool {
         matches!(
             self,
