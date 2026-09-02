@@ -651,10 +651,10 @@ impl PathAssignments {
             }
         }
 
-        let constraints: SmallVec<[Constraint<'db>; 4]> =
-            std::iter::chain(left.into_new(), right.into_new()).collect();
-        for left in &constraints {
-            for right in &constraints {
+        let left_constraints = left.into_new();
+        let right_constraints = right.into_new();
+        for left in &left_constraints {
+            for right in &right_constraints {
                 if *left == *right {
                     continue;
                 }
