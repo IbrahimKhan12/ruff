@@ -238,58 +238,46 @@ impl<'db> Constraint<'db> {
     }
 
     /// Returns the constraints that model the requirement that `typevar` must be equivalent to
-    /// `bound`. Unlike [`new_lower_bound`][Self::new_lower_bound] and
-    /// [`new_upper_bound`][Self::new_upper_bound], we do not break apart unions or intersections
-    /// to create separate constraints. Returns `None` when the relationship always holds (e.g.
-    /// when comparing a typevar with itself).
+    /// `bound`.
+    ///
+    /// A fully static equality is represented by one equivalence constraint when possible. Gradual
+    /// bounds are represented by separate lower and upper constraints. We also use the latter
+    /// representation when a top-level union or intersection refers to `typevar` itself, so that
+    /// the tautological half of the equality can be removed without discarding the other half.
     pub(super) fn new_equivalence_bound(
         db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         provenance: ConstraintProvenance,
         typevar: BoundTypeVarInstance<'db>,
         bound: Type<'db>,
-    ) -> Option<Result<Self, UnsatisfiableBound>> {
-        match bound {
+    ) -> impl Iterator<Item = Result<Self, UnsatisfiableBound>> {
+        let is_same_typevar = |element: &Type<'db>| {
+            element
+                .as_typevar()
+                .is_some_and(|element| typevar.is_same_typevar_as(db, element))
+        };
+        let bound_refers_to_typevar = match bound {
+            Type::Union(union) => union.elements(db).iter().any(&is_same_typevar),
+            Type::Intersection(intersection) => {
+                intersection.positive(db).iter().any(&is_same_typevar)
+                    || intersection.negative(db).iter().any(is_same_typevar)
+            }
+            _ => false,
+        };
+
+        if bound.bottom_materialization(db, env) != bound.top_materialization(db, env)
+            || bound_refers_to_typevar
+        {
+            return Either::Left(std::iter::chain(
+                Self::new_lower_bound(db, provenance, typevar, bound),
+                Self::new_upper_bound(db, env, provenance, typevar, bound),
+            ));
+        }
+
+        let constraint = match bound {
             // Two identical typevars must always solve to the same type, so it is not useful to
             // have an equivalence bound that is the typevar being constrained.
             Type::TypeVar(bound) if typevar.is_same_typevar_as(db, bound) => None,
-
-            // The same applies for an equivalence bound that's an intersection containing the
-            // typevar being constrained.
-            Type::Intersection(intersection)
-                if intersection.positive(db).iter().any(|element| {
-                    element.as_typevar().is_some_and(|element_bound_typevar| {
-                        typevar.is_same_typevar_as(db, element_bound_typevar)
-                    })
-                }) =>
-            {
-                None
-            }
-
-            // And if we find the _negation_ of the typevar being constrained, the overall result
-            // is unsatisfiable.
-            Type::Intersection(intersection)
-                if intersection.negative(db).iter().any(|element| {
-                    element.as_typevar().is_some_and(|element_bound_typevar| {
-                        typevar.is_same_typevar_as(db, element_bound_typevar)
-                    })
-                }) =>
-            {
-                Some(Err(UnsatisfiableBound))
-            }
-
-            // The same applies for an equivalence bound that's a union containing the typevar
-            // being constrained.
-            Type::Union(union)
-                if union.elements(db).iter().any(|element| {
-                    element.as_typevar().is_some_and(|element_bound_typevar| {
-                        typevar.is_same_typevar_as(db, element_bound_typevar)
-                    })
-                }) =>
-            {
-                None
-            }
-
-            // Otherwise we construct a concrete or typevar constraint, as appropriate.
             Type::TypeVar(bound) => Some(Ok(Constraint::TypeVarEquivalence(
                 TypeVarEquivalenceBound::new(provenance, typevar, bound),
             ))),
@@ -300,7 +288,8 @@ impl<'db> Constraint<'db> {
                     bound,
                 },
             ))),
-        }
+        };
+        Either::Right(constraint.into_iter())
     }
 
     pub(super) fn is_reflexive_typevar_relation(self, db: &'db dyn Db) -> bool {
@@ -696,7 +685,7 @@ impl<'db> ConcreteEquivalenceBound<'db> {
         match subject {
             Type::TypeVar(typevar) => {
                 let applied =
-                    Constraint::new_equivalence_bound(db, self.provenance, typevar, bound);
+                    Constraint::new_equivalence_bound(db, env, self.provenance, typevar, bound);
                 Constraint::new_nodes(db, env, &mut storage, applied)
             }
             _ => storage.load(
@@ -957,13 +946,23 @@ impl<'db> TypeVarEquivalenceBound<'db> {
         let mut storage = builder.storage.borrow_mut();
         match (left, right) {
             (Type::TypeVar(left_typevar), _) => {
-                let applied =
-                    Constraint::new_equivalence_bound(db, self.provenance, left_typevar, right);
+                let applied = Constraint::new_equivalence_bound(
+                    db,
+                    env,
+                    self.provenance,
+                    left_typevar,
+                    right,
+                );
                 Constraint::new_nodes(db, env, &mut storage, applied)
             }
             (_, Type::TypeVar(right_typevar)) => {
-                let applied =
-                    Constraint::new_equivalence_bound(db, self.provenance, right_typevar, left);
+                let applied = Constraint::new_equivalence_bound(
+                    db,
+                    env,
+                    self.provenance,
+                    right_typevar,
+                    left,
+                );
                 Constraint::new_nodes(db, env, &mut storage, applied)
             }
             _ => storage.load(
