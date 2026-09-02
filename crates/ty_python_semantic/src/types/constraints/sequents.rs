@@ -1471,6 +1471,14 @@ impl<'db> ConcreteUpperBound<'db> {
             );
         }
 
+        // Keep unions as separate, factored upper bounds. Intersecting a union with another bound
+        // can distribute the result into a union of intersections. That expanded type no longer
+        // looks like an intersection, and repeatedly combining it with other upper bounds can
+        // produce a combinatorial number of equivalent constraints.
+        if self.bound.is_union() || other.bound.is_union() {
+            return;
+        }
+
         // `(T ≤ α) ∧ (T ≤ β)` is equivalent to `T ≤ (α & β)`. We do not create upper bounds that
         // are intersections, so only add sequents when the intersection simplifies away.
         let combined = possibly_reversed_intersection(db, env, reversed, self.bound, other.bound);
