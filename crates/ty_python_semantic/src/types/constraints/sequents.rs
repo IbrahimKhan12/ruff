@@ -2373,6 +2373,30 @@ impl<'db> ConcreteLowerBound<'db> {
         // We can infer sequents from `α ≤ T` and `U ≤ β` if α _contains_ U and/or β contains T.
         if !self.typevar.is_same_typevar_as(db, other.typevar) {
             Constraint::add_contravariant_tightened_sequent(db, env, map, self, other);
+
+            // `(T ≤ pivot) ∧ (pivot ≤ U) → (T ≤ U)` when both constraints use the same
+            // fully static pivot type.
+            if !other.bound.is_never()
+                && !other.bound.is_object()
+                && !self.bound.has_typevar(db, env)
+                && !other.bound.has_typevar(db, env)
+                && self.bound.is_static_sequent_eligible(db, env)
+                && other.bound.is_static_sequent_eligible(db, env)
+                && other
+                    .bound
+                    .is_constraint_set_equivalent_to(db, env, self.bound)
+            {
+                let derived = TypeVarRangeBound {
+                    provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                    left: other.typevar,
+                    right: self.typevar,
+                };
+                map.add_pair_implication(
+                    Constraint::ConcreteLower(self),
+                    Constraint::ConcreteUpper(other),
+                    Constraint::TypeVarRange(derived),
+                );
+            }
             return;
         }
 
