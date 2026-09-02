@@ -1852,9 +1852,13 @@ enum InterimConstraint<'db> {
 }
 
 impl<'db> InterimConstraint<'db> {
-    fn into_new(self) -> SmallVec<[Constraint<'db>; 2]> {
+    fn into_new(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> SmallVec<[Constraint<'db>; 2]> {
         match self {
-            InterimConstraint::Old(constraint) => constraint.into_new(),
+            InterimConstraint::Old(constraint) => constraint.into_new(db, env),
             InterimConstraint::New(constraint) => smallvec![constraint],
         }
     }
@@ -1991,7 +1995,28 @@ pub(crate) struct OldConstraint<'db> {
 }
 
 impl<'db> OldConstraint<'db> {
-    fn into_new(self) -> SmallVec<[Constraint<'db>; 2]> {
+    fn into_new(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> SmallVec<[Constraint<'db>; 2]> {
+        if let (Some(lower), Some(upper)) = (self.bounds.lower, self.bounds.upper) {
+            let (lower_provenance, lower) = lower.into_parts();
+            let (upper_provenance, upper) = upper.into_parts();
+            if lower == upper
+                && lower.bottom_materialization(db, env) == upper.top_materialization(db, env)
+            {
+                return Constraint::new_equivalence_bound(
+                    db,
+                    ConstraintProvenance::derived(lower_provenance, upper_provenance),
+                    self.typevar,
+                    lower,
+                )
+                .into_iter()
+                .collect();
+            }
+        }
+
         let mut result = SmallVec::default();
 
         if let Some(lower) = self.bounds.lower {
@@ -4413,7 +4438,7 @@ impl<'db> PathBounds<'db> {
                     }
 
                     let constraint = storage.constraint_data(interior.constraint);
-                    for constraint in constraint.into_new() {
+                    for constraint in constraint.into_new(db, env) {
                         match constraint {
                             Constraint::ConcreteLower(lower) => {
                                 if !lower.typevar.is_inferable(db, inferable) {

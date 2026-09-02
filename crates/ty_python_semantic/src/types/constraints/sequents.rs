@@ -1633,6 +1633,8 @@ impl<'db> Constraint<'db> {
 
         let when = lower_bound.when_constraint_set_assignable_to_owned(db, env, upper_bound);
         Self::add_constraint_set_implication(
+            db,
+            env,
             map,
             lower_constraint,
             upper_constraint,
@@ -1654,6 +1656,8 @@ impl<'db> Constraint<'db> {
 
         let when = lower_bound.when_constraint_set_equivalent_to_owned(db, env, upper_bound);
         Self::add_constraint_set_implication(
+            db,
+            env,
             map,
             lower_constraint,
             upper_constraint,
@@ -1662,6 +1666,8 @@ impl<'db> Constraint<'db> {
     }
 
     fn add_constraint_set_implication(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
         map: &mut SequentMap<Constraint<'db>>,
         lower_constraint: Self,
         upper_constraint: Self,
@@ -1743,7 +1749,7 @@ impl<'db> Constraint<'db> {
                                     typevar: derived.typevar,
                                     bounds: ConstraintBounds::new(lower, upper),
                                 });
-                                old.into_new()
+                                old.into_new(db, env)
                             }
                             InterimConstraint::New(derived) => smallvec![derived],
                         };
@@ -2460,6 +2466,27 @@ impl<'db> ConcreteLowerBound<'db> {
             Constraint::add_covariant_lower_tightened_sequent(db, env, map, other, self);
             Constraint::add_contravariant_tightened_sequent(db, env, map, self, other);
             Constraint::add_invariant_tightened_sequent(db, env, map, self, other);
+
+            // `(pivot ≤ T) ∧ (U = pivot) → (U ≤ T)`.
+            if !self.bound.has_typevar(db, env)
+                && !other.bound.has_typevar(db, env)
+                && self.bound.is_static_sequent_eligible(db, env)
+                && other.bound.is_static_sequent_eligible(db, env)
+                && self
+                    .bound
+                    .is_constraint_set_equivalent_to(db, env, other.bound)
+            {
+                let derived = TypeVarRangeBound {
+                    provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                    left: other.typevar,
+                    right: self.typevar,
+                };
+                map.add_pair_implication(
+                    Constraint::ConcreteLower(self),
+                    Constraint::ConcreteEquivalence(other),
+                    Constraint::TypeVarRange(derived),
+                );
+            }
             return;
         }
 
@@ -2672,6 +2699,27 @@ impl<'db> ConcreteUpperBound<'db> {
             Constraint::add_covariant_upper_tightened_sequent(db, env, map, other, self);
             Constraint::add_contravariant_tightened_sequent(db, env, map, other, self);
             Constraint::add_invariant_tightened_sequent(db, env, map, self, other);
+
+            // `(T ≤ pivot) ∧ (U = pivot) → (T ≤ U)`.
+            if !self.bound.has_typevar(db, env)
+                && !other.bound.has_typevar(db, env)
+                && self.bound.is_static_sequent_eligible(db, env)
+                && other.bound.is_static_sequent_eligible(db, env)
+                && self
+                    .bound
+                    .is_constraint_set_equivalent_to(db, env, other.bound)
+            {
+                let derived = TypeVarRangeBound {
+                    provenance: ConstraintProvenance::derived(self.provenance, other.provenance),
+                    left: self.typevar,
+                    right: other.typevar,
+                };
+                map.add_pair_implication(
+                    Constraint::ConcreteUpper(self),
+                    Constraint::ConcreteEquivalence(other),
+                    Constraint::TypeVarRange(derived),
+                );
+            }
             return;
         }
 
