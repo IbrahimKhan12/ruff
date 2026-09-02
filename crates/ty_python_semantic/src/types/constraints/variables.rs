@@ -7,8 +7,8 @@ use itertools::Either;
 use salsa::plumbing::AsId;
 
 use crate::types::constraints::{
-    ALWAYS_FALSE, ALWAYS_TRUE, ConstraintSetBuilder, ConstraintSetStorage, InterimConstraint, Node,
-    NodeId, SourceOrderId, max_constructor_and_typevar_depth,
+    ALWAYS_FALSE, ALWAYS_TRUE, ConstraintSetBuilder, ConstraintSetStorage, Node, NodeId,
+    SourceOrderId, max_constructor_and_typevar_depth,
 };
 use crate::types::typevar::TypeVarSet;
 use crate::types::{ApplyTypeMappingVisitor, BoundTypeVarInstance, Type, TypeContext, TypeMapping};
@@ -87,7 +87,7 @@ impl<'db> Constraint<'db> {
         env: &ProgramEnvironment<'db>,
         storage: &mut ConstraintSetStorage<'db>,
     ) -> (NodeId, Option<SourceOrderId>) {
-        let constraint_id = storage.intern_constraint(db, env, InterimConstraint::New(self));
+        let constraint_id = storage.intern_constraint(db, env, self);
         Node::new_constraint(storage, constraint_id)
     }
 
