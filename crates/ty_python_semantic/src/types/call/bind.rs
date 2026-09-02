@@ -2876,12 +2876,11 @@ impl<'db> Bindings<'db> {
                         };
                         let constraints = ConstraintSetBuilder::new();
                         let result = constraints.into_owned(|constraints| {
-                            ConstraintSet::constrain_typevar(
+                            ConstraintSet::constrain_typevar_equivalence_bound(
                                 db,
                                 env,
                                 constraints,
                                 typevar,
-                                value,
                                 value,
                             )
                         });
