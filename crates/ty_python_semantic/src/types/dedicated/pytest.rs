@@ -75,6 +75,7 @@ use crate::{Db, FxIndexMap, FxIndexSet};
 
 mod collection;
 
+pub use collection::{PytestTest, pytest_tests_in_file};
 use collection::{PytestTestKind, pytest_test_for_binding};
 
 /// Resolves pytest fixtures requested by `parameter`.
